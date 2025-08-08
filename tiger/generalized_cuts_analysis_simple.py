@@ -30,24 +30,92 @@ from sotodlib.utils.procs_pool import get_exec_env
 from so3g.proj import Ranges, RangesMatrix
 
 
-def parse_config_for_cuts(config_file: str) -> Tuple[List[str], List[str]]:
+def get_wrap_name_from_process_name(process_name: str, process_config: dict = None) -> str:
     """
-    Parse configuration file to extract the order of sample and detector cuts.
+    Map from the process name in the config to the actual wrap name used in proc_aman.wrap().
+    This is necessary because the process class 'name' attribute doesn't always match
+    the string passed to proc_aman.wrap() in the save method.
+    
+    Args:
+        process_name: The 'name' field from the config process
+        process_config: The full process config dict (for customizable wrap names)
+        
+    Returns:
+        The actual wrap name used in proc_aman.wrap()
+    """
+    if process_config is None:
+        process_config = {}
+    
+    # Handle processes with customizable wrap names based on sotodlib/preprocess/processes.py
+    if process_name == 'glitches':
+        # GlitchDetection: uses self.glitch_name = step_cfgs.get('glitch_name', 'glitches')
+        return process_config.get('glitch_name', 'glitches')
+        
+    elif process_name == 'jumps':
+        # Jumps: uses self.save_cfgs.get('jumps_name', 'jumps')
+        save_cfg = process_config.get('save', {})
+        if isinstance(save_cfg, dict):
+            return save_cfg.get('jumps_name', 'jumps')
+        else:
+            return 'jumps'
+            
+    elif process_name == 'source_flags':
+        # SourceFlags: uses self.source_flags_name = step_cfgs.get('source_flags_name', 'source_flags')
+        return process_config.get('source_flags_name', 'source_flags')
+        
+    elif process_name == 'noise':
+        # CalcNoise: uses self.save_cfgs['wrap_name'] if specified, otherwise 'noise'
+        save_cfg = process_config.get('save', {})
+        if isinstance(save_cfg, dict):
+            return save_cfg.get('wrap_name', 'noise')
+        else:
+            return 'noise'
+    
+    # Static mapping for processes where name == wrap_name
+    static_mapping = {
+        # Flag processes that use their name directly
+        'split_flags': 'split_flags',
+        'ptp_flags': 'ptp_flags', 
+        'inv_var_flags': 'inv_var_flags',
+        
+        # Processes with name != wrap_name but no customization
+        'flag_turnarounds': 'turnaround_flags',
+        'det_bias_cuts': 'det_bias_flags',
+        'trends': 'trends',
+        
+        # Other processes that use name directly
+        'hwp_angle': 'hwp_angle',
+        'darks': 'darks',
+        'sso_footprint': 'sso_footprint',
+    }
+    
+    # Return mapped name or fall back to original name
+    return static_mapping.get(process_name, process_name)
+
+
+def parse_config_for_cuts(config_file: str) -> Tuple[List[str], List[str], str]:
+    """
+    Parse configuration file to extract the order of sample and detector cuts
+    and the name of the last process.
     
     Args:
         config_file: Path to preprocessing configuration file
         
     Returns:
-        Tuple of (sample_cuts_order, detector_cuts_order)
+        Tuple of (sample_cuts_order, detector_cuts_order, last_process_name)
     """
     with open(config_file, 'r') as f:
         config = yaml.safe_load(f)
     
     sample_cuts = []
     detector_cuts = []
+    last_process_wrap_name = None
     
     for process in config.get('process_pipe', []):
         name = process.get('name', '')
+        # Get the actual wrap name that will be used in proc_aman.wrap()
+        wrap_name = get_wrap_name_from_process_name(name, process)
+        last_process_wrap_name = wrap_name  # Track the last process wrap name
         
         # Processes that primarily create sample cuts/flags
         if any(flag_type in name for flag_type in [
@@ -103,7 +171,7 @@ def parse_config_for_cuts(config_file: str) -> Tuple[List[str], List[str]]:
             if cut_name not in detector_cuts:
                 detector_cuts.append(cut_name)
     
-    return sample_cuts, detector_cuts
+    return sample_cuts, detector_cuts, last_process_wrap_name
 
 
 def count_new_cuts(ranges_matrix, survivors_mask, already_cut):
@@ -136,9 +204,13 @@ def count_new_cuts(ranges_matrix, survivors_mask, already_cut):
 
 
 def get_dict_entry(entry, config_file_init, config_file_proc, noise_range, 
-                   sample_cuts_order, detector_cuts_order):
+                   sample_cuts_order, detector_cuts_order, last_process_name):
     """
-    Generalized version of get_dict_entry that uses configuration-derived order.
+    Generalized version of get_dict_entry that uses configuration-derived order
+    and dynamically determines proc_survivors_mask from the last process wrap name.
+    
+    Args:
+        last_process_name: The actual wrap name used in proc_aman.wrap() for the final process
     """
     try:
         logger = preprocess_util.init_logger('subproc_logger')
@@ -161,7 +233,22 @@ def get_dict_entry(entry, config_file_init, config_file_proc, noise_range,
         nsamp = mdata_init.samps.count
         
         # Find detectors that survive all cuts
-        proc_survivors_mask = has_all_cut(mdata_proc.preprocess.split_flags.valid)
+        # Get proc_survivors_mask from the last process in the pipeline
+        if not last_process_name:
+            raise ValueError("No last process name found in configuration file")
+            
+        if not hasattr(mdata_proc.preprocess, last_process_name):
+            raise AttributeError(f"Last process '{last_process_name}' not found in mdata_proc.preprocess. "
+                                f"Available attributes: {list(mdata_proc.preprocess._fields.keys())}")
+            
+        last_process_data = getattr(mdata_proc.preprocess, last_process_name)
+        
+        if not hasattr(last_process_data, 'valid'):
+            raise AttributeError(f"Last process '{last_process_name}' has no 'valid' attribute. "
+                                f"Available attributes: {list(last_process_data._fields.keys())}")
+            
+        proc_survivors_mask = has_all_cut(last_process_data.valid)
+        
         survivors_mask = np.zeros(mdata_init.dets.count, dtype=bool)
         _, ind_init, _ = np.intersect1d(mdata_init.dets.vals, 
                                       mdata_proc.dets.vals[proc_survivors_mask], 
@@ -296,8 +383,11 @@ def get_dict_entry(entry, config_file_init, config_file_proc, noise_range,
             keys.append('noisy_subscans_cuts')
             vals.append(np.sum(~x_proc.noisy_dets_flags.valid_dets))
         
-        # End yield
-        m = has_all_cut(x_proc.split_flags.valid)
+        # End yield - use the last process dynamically
+        # Note: We already validated that last_process_name exists and has 'valid' attribute above
+        last_process_data = getattr(x_proc, last_process_name)
+        m = has_all_cut(last_process_data.valid)
+        
         keys.append('end_yield')
         vals.append(np.sum(m))
         
@@ -352,8 +442,9 @@ def main(executor, as_completed_callable, config_file_init, config_file_proc,
     
     # Parse configurations to get cut order
     logger.info('Parsing configuration files for cuts order...')
-    sample_cuts_init, detector_cuts_init = parse_config_for_cuts(config_file_init)
-    sample_cuts_proc, detector_cuts_proc = parse_config_for_cuts(config_file_proc)
+    # Parse configuration files to get cuts ordering and last process wrap names
+    sample_cuts_init, detector_cuts_init, last_wrap_name_init = parse_config_for_cuts(config_file_init)
+    sample_cuts_proc, detector_cuts_proc, last_wrap_name_proc = parse_config_for_cuts(config_file_proc)
     
     # Combine orders (init first, then proc)
     sample_cuts_order = sample_cuts_init + sample_cuts_proc
@@ -380,7 +471,8 @@ def main(executor, as_completed_callable, config_file_init, config_file_proc,
         config_file_proc=config_file_proc, 
         noise_range=noise_range,
         sample_cuts_order=sample_cuts_order,
-        detector_cuts_order=detector_cuts_order
+        detector_cuts_order=detector_cuts_order,
+        last_process_name=last_wrap_name_proc
     )
     
     # Build table schema
@@ -410,7 +502,8 @@ def main(executor, as_completed_callable, config_file_init, config_file_proc,
                               config_file_proc=config_file_proc,
                               noise_range=noise_range,
                               sample_cuts_order=sample_cuts_order,
-                              detector_cuts_order=detector_cuts_order) 
+                              detector_cuts_order=detector_cuts_order,
+                              last_process_name=last_wrap_name_proc) 
                for entry in run_list]
     
     for future in as_completed_callable(futures):
