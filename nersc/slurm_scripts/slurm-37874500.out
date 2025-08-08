@@ -1,5 +1,0 @@
-Using 1 node(s), which have 256 thread slots each.
-Starting 64 process(es) per node (63 total), each with 2 OpenMP threads.
-srun -n 1 python3 /global/homes/m/msilvafe/so_home/scripts/check_timing.py --context '/global/cfs/cdirs/sobs/metadata/satp3/contexts/use_this_local.yaml' --query 'type=='\''obs'\'' and subtype=='\''cmb'\'' and duration <5400 and duration>600 and start_time > 1719817200 and start_time < 1735718400' --errlog-ext satp3_timing_check.txt --savename satp3_timing_check --nproc 63
-Launching pipeline at Sat 19 Apr 2025 02:12:10 AM PDT
-Ending batch script at Sat 19 Apr 2025 02:45:11 AM PDT
