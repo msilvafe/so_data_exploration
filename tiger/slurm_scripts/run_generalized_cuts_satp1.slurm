@@ -14,7 +14,7 @@ set -e
 export SOTODLIB_RESOURCES='{"de421.bsp": "file:///scratch/gpfs/SIMONSOBS/planets/de421.bsp"}'
 
 # Output directory and log file
-output_dir="/scratch/gpfs/SIMONSOBS/users/ms3067/generalized_cuts/satp1"
+output_dir="/scratch/gpfs/SIMONSOBS/users/ms3067/iso_stats/generalized_script/v1/satp1"
 log="${output_dir}/log_generalized_cuts_satp1_$(date +%Y%m%d).log"
 
 # Create output directory if it doesn't exist
@@ -42,7 +42,7 @@ config_proc="/home/ms3067/repos/iso-sat/v1/preprocessing/satp1/preprocessing_con
 output_file="${output_dir}/generalized_cuts_satp1_$(date +%Y%m%d).sqlite"
 errlog_file="${output_dir}/generalized_cuts_errlog_satp1_$(date +%Y%m%d).txt"
 
-com="${launch_str} python3 /home/ms3067/repos/so_data_exploration/tiger/generalized_cuts_analysis_simple.py \
+com="${launch_str} python3 /home/ms3067/so_data_exploration/tiger/generalized_cuts_analysis_simple.py \
 ${config_init} \
 ${config_proc} \
 --noise-range 18e-6 80e-6 \

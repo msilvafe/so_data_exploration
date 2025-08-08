@@ -5,14 +5,14 @@ set -e
 #=========== USER CONFIGURATION ============
 
 # Input database file - UPDATE THIS PATH
-input_db="/scratch/gpfs/SIMONSOBS/users/ms3067/generalized_cuts/satp1/generalized_cuts_satp1_20250807.sqlite"
+input_db="/scratch/gpfs/SIMONSOBS/users/ms3067/iso_stats/generalized_script/v1/satp1/generalized_cuts_satp1_20250807.sqlite"
 
 # Timestamp range for analysis - UPDATE THESE
 start_ts=1716177600  # Start timestamp
 end_ts=1734315803    # End timestamp
 
 # Output directory - will be created if it doesn't exist
-output_dir="/scratch/gpfs/SIMONSOBS/users/ms3067/generalized_cuts/tables_$(date +%Y%m%d)"
+output_dir="/scratch/gpfs/SIMONSOBS/users/ms3067/iso_stats/generalized_script/v1/satp1/tables_$(date +%Y%m%d)"
 
 #=========== SETUP ============
 
@@ -32,7 +32,7 @@ echo ""
 
 echo "Generating summary tables at $(date)"
 
-python3 /home/ms3067/repos/so_data_exploration/tiger/generate_cuts_tables.py \
+python3 /home/ms3067/so_data_exploration/tiger/generate_cuts_tables.py \
     ${input_db} \
     --start-ts ${start_ts} \
     --end-ts ${end_ts} \
