@@ -1,0 +1,68 @@
+#!/bin/bash -l
+
+#SBATCH --qos=regular
+#SBATCH --constraint=cpu
+#SBATCH --account=mp107b
+#SBATCH --nodes=1
+#SBATCH --time=01:00:00
+#SBATCH --job-name=timing_check
+#SBATCH --mail-user maximiliano.silva-feaver@yale.edu
+#SBATCH --mail-type all
+
+set -e
+
+# Number or processes per node
+NODE_PROC=64
+
+# Log file
+log="/global/homes/m/msilvafe/so_home/shared_files/timing_check/slurm_log_satp3"
+
+#=========== Compute runtime parameters ============
+
+# Set TMPDIR to be on the ramdisk
+export TMPDIR=/dev/shm
+
+# nodes used by this job
+NODES=${SLURM_JOB_NUM_NODES}
+
+# set procs and threads
+NODE_SLOTS=256
+NODE_CORES=128
+PROC_THREADS=$(( NODE_CORES / NODE_PROC ))
+PROC_DEPTH=$(( NODE_SLOTS / NODE_PROC ))
+
+# total number of processes on all nodes
+NPROC=$(( NODES * NODE_PROC - 1))
+
+echo "Using ${NODES} node(s), which have ${NODE_SLOTS} thread slots each."
+echo "Starting ${NODE_PROC} process(es) per node (${NPROC} total), each with ${PROC_THREADS} OpenMP threads."
+
+export OMP_NUM_THREADS=${PROC_THREADS}
+
+# Because we are using multiprocessing, we do NOT want to specify any pinning
+# of processes / threads to specific cores.  This is because the processes are
+# spawned dynamically.  If using MPI we would change to these lines.
+#
+# export OMP_PROC_BIND=spread
+# export OMP_PLACES=threads
+#launch_str="srun -n ${NPROC} -N ${NODES} -c ${PROC_DEPTH} --cpu_bind=cores"
+
+# The launching command and options.  We are just launching a single process
+# (the starting python process) with no binding of processes to cores.
+launch_str="srun -n 1"
+
+#=========== Run it ============
+
+com="${launch_str} python3 /global/homes/m/msilvafe/so_home/scripts/check_timing.py \
+--context '/global/cfs/cdirs/sobs/metadata/satp3/contexts/use_this_local.yaml'
+--query 'type=='\''obs'\'' and subtype=='\''cmb'\'' and duration <5400 and duration>600 and start_time > 1719817200 and start_time < 1735718400' \
+--ufm-list ufm_mv12 ufm_mv17 ufm_mv23 ufm_mv33 ufm_mv35 ufm_mv5 ufm_mv27 \
+--errlog-ext satp3_timing_check.txt \
+--savename satp3_timing_check \
+--nproc ${NPROC}"
+
+echo ${com}
+echo "Launching pipeline at $(date)"
+eval ${com} > ${log} 2>&1
+
+echo "Ending batch script at $(date)"
