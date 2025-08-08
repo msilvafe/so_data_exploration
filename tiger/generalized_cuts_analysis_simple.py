@@ -55,38 +55,53 @@ def parse_config_for_cuts(config_file: str) -> Tuple[List[str], List[str]]:
         ]):
             # Generate the nsamps field name
             if 'turnaround' in name:
-                sample_cuts.append('turnaround_nsamps')
+                cut_name = 'turnaround_nsamps'
+                if cut_name not in sample_cuts:
+                    sample_cuts.append(cut_name)
             elif 'jump' in name:
                 # Handle different jump types
                 if 'slow' in name or process.get('calc', {}).get('function') == 'slow_jumps':
-                    sample_cuts.append('jumps_slow_nsamps')
+                    cut_name = 'jumps_slow_nsamps'
                 elif '2pi' in name or process.get('calc', {}).get('function') == 'twopi_jumps':
-                    sample_cuts.append('jumps_2pi_nsamps')
+                    cut_name = 'jumps_2pi_nsamps'
                 else:
-                    sample_cuts.append('jumps_nsamps')
+                    cut_name = 'jumps_nsamps'
+                if cut_name not in sample_cuts:
+                    sample_cuts.append(cut_name)
             elif 'glitch' in name:
-                sample_cuts.append('glitch_nsamps')
+                cut_name = 'glitch_nsamps'
+                if cut_name not in sample_cuts:
+                    sample_cuts.append(cut_name)
             elif 'source' in name:
-                sample_cuts.append('source_flags_nsamps')
+                cut_name = 'source_flags_nsamps'
+                if cut_name not in sample_cuts:
+                    sample_cuts.append(cut_name)
             elif 'subscan' in name:
-                sample_cuts.append('noisy_subscans_nsamps')
+                cut_name = 'noisy_subscans_nsamps'
+                if cut_name not in sample_cuts:
+                    sample_cuts.append(cut_name)
         
         # Processes that primarily create detector cuts
         elif any(flag_type in name for flag_type in [
             'fp_', 'trend', 'bias', 'ptp', 'noise', 'inv_var'
         ]):
             if 'fp_' in name or 'fp' == name:
-                detector_cuts.append('fp_cuts')
+                cut_name = 'fp_cuts'
             elif 'trend' in name:
-                detector_cuts.append('trend_cuts')
+                cut_name = 'trend_cuts'
             elif 'bias' in name:
-                detector_cuts.append('det_bias_cuts')
+                cut_name = 'det_bias_cuts'
             elif 'ptp' in name:
-                detector_cuts.append('ptp_cuts')
+                cut_name = 'ptp_cuts'
             elif 'noise' in name:
-                detector_cuts.append('white_noise_cuts')
+                cut_name = 'white_noise_cuts'
             elif 'inv_var' in name:
-                detector_cuts.append('inv_var_cuts')
+                cut_name = 'inv_var_cuts'
+            else:
+                continue
+            
+            if cut_name not in detector_cuts:
+                detector_cuts.append(cut_name)
     
     return sample_cuts, detector_cuts
 
@@ -210,6 +225,13 @@ def get_dict_entry(entry, config_file_init, config_file_proc, noise_range,
                 n_cuts, already_cut = count_new_cuts(x.jumps_2pi.jump_flag, 
                                                     survivors_mask, already_cut)
                 keys.append('jumps_2pi_nsamps')
+                vals.append(int(n_cuts))
+                
+            elif cut_name == 'jumps_nsamps' and hasattr(x, 'jumps'):
+                # Generic jumps (if not handled by specific types above)
+                n_cuts, already_cut = count_new_cuts(x.jumps.jump_flag, 
+                                                    survivors_mask, already_cut)
+                keys.append('jumps_nsamps')
                 vals.append(int(n_cuts))
                 
             elif cut_name == 'glitch_nsamps' and hasattr(x, 'glitches'):
