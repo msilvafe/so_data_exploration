@@ -1,0 +1,17 @@
+=== 112-CPU PARALLEL SCAN RESULTS ===
+Generated: 2025-08-08 15:30:59
+CPUs used: 112
+Node: tiger-g01c6n2
+Directory: /scratch/gpfs/SIMONSOBS/sat-iso
+Username: ms3067
+
+DIRECTORY USAGE SUMMARY:
+=================================================================
+/scratch/gpfs/SIMONSOBS/sat-iso/v3/preprocessing/satp1_20250801_init     12856.91 GB (13804998484266 bytes)
+/scratch/gpfs/SIMONSOBS/sat-iso/v3/preprocessing/satp3_20250801_init      7599.26 GB (8159646074715 bytes)
+/scratch/gpfs/SIMONSOBS/sat-iso/v3/preprocessing/satp3_20250801_init/temp       318.06 GB (341519311996 bytes)
+/scratch/gpfs/SIMONSOBS/sat-iso/v3/preprocessing                          1.38 GB (1478599146 bytes)
+/scratch/gpfs/SIMONSOBS/sat-iso/v2/preprocessing                        878.16 MB (920818323 bytes)
+=================================================================
+TOTAL USAGE:                                                          20776.47 GB (22308563288446 bytes)
+TOTAL FILES:                                                                 5167 files
