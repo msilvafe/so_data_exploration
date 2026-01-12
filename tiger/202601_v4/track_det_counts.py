@@ -367,7 +367,7 @@ def _main(executor: Union["MPICommExecutor", "ProcessPoolExecutor"],
     count_names = None
 
     # Run observations in parallel
-    futures = [executor.submit(track_det_counts_obs, obs_id=obs['obs_id'],
+    futures = [executor.submit(track_det_counts_obs, obs['obs_id'],
                               configs_init=configs_init,
                               configs_proc=configs_proc,
                               db_path=db_path,
