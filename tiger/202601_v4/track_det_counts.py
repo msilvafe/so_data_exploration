@@ -82,8 +82,8 @@ def track_det_counts_single(obsid: str,
     
     try:
         # Initialize contexts
-        ctx_init = core.Context(configs_init["context_file"])
-        ctx_proc = core.Context(configs_proc["context_file"])
+        cfg_init, ctx_init = pp_util.get_preprocess_context(configs_init)
+        cfg_proc, ctx_proc = pp_util.get_preprocess_context(configs_proc)
         
         dets = {'wafer_slot': wafer, 'wafer.bandpass': band}
         counts = []
@@ -128,8 +128,8 @@ def track_det_counts_single(obsid: str,
             logger.warning(f"{wafer} {band} get_meta failed, trying get_obs: {e}")
             
             # Reset contexts and modify metadata
-            ctx_init = core.Context(configs_init["context_file"])
-            ctx_proc = core.Context(configs_proc["context_file"])
+            cfg_init, ctx_init = pp_util.get_preprocess_context(configs_init)
+            cfg_proc, ctx_proc = pp_util.get_preprocess_context(configs_proc)
             ctx_init['metadata'] = ctx_init['metadata'][:-1]
             ctx_proc['metadata'] = ctx_proc['metadata'][:-1]
             
