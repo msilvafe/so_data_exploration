@@ -15,8 +15,7 @@ from sotodlib import core
 from sotodlib.core import AxisManager
 import sotodlib.site_pipeline.util as sp_util
 from sotodlib.preprocess import preprocess_util as pp_util
-from sotodlib.preprocess import _Preprocess, Pipeline, processes
-import sotodlib.preprocess.processes as pcore
+from sotodlib.preprocess import _Preprocess, Pipeline, processes, pcore
 
 logger = sp_util.init_logger("track_det_counts")
 
