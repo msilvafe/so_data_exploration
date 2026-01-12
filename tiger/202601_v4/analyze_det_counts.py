@@ -12,6 +12,54 @@ import seaborn as sns
 import numpy as np
 from pathlib import Path
 
+def obsid_counts_matrix(db_path, wafer, band):
+    """Fetch the detector counts matrix for a specific wafer and band.
+    Args:
+        db_path (str): Path to the SQLite database.
+        wafer (str): Wafer identifier (e.g., 'ws0').
+        band (str): Band identifier (e.g., 'f090'). 
+
+    Returns:
+        obsids (np.ndarray): Array of observation IDs.
+        data (np.ndarray): 2D array of detector counts, shape (num_obsids, num_steps).
+    """
+    with sqlite3.connect(db_path) as conn:
+        conn.row_factory = sqlite3.Row
+
+        step_cols = [
+            col["name"]
+            for col in conn.execute("PRAGMA table_info(detector_counts)")
+            if col["name"] not in ("obsid", "wafer", "band")
+        ]
+        quoted_cols = [f'"{col}"' for col in step_cols]
+
+        sql = f"""
+            SELECT obsid, {", ".join(quoted_cols)}
+            FROM detector_counts
+            WHERE wafer = ? AND band = ?
+            ORDER BY obsid
+        """
+        rows = conn.execute(sql, (wafer, band)).fetchall()
+
+    obsids = np.array([row["obsid"] for row in rows], dtype=str)
+    data = np.array([[row[col] for col in step_cols] for row in rows], dtype=float)
+    return obsids, data
+
+def fetch_step_names(db_path: str) -> np.ndarray:
+    """Fetch the names of the processing steps from the database.
+    Args:
+        db_path (str): Path to the SQLite database.
+    Returns:
+        np.ndarray: Array of step names.
+    """
+    with sqlite3.connect(db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        names = [
+            col["name"]
+            for col in conn.execute("PRAGMA table_info(detector_counts)")
+            if col["name"] not in ("obsid", "wafer", "band")
+        ]
+    return np.array(names, dtype=str)
 
 def get_database_info(db_path: str):
     """Get basic information about the database structure and contents."""

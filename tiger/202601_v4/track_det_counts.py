@@ -20,6 +20,24 @@ from sotodlib.preprocess import _Preprocess, Pipeline, processes, pcore
 logger = sp_util.init_logger("track_det_counts")
 
 
+def build_count_names(configs_init, configs_proc):
+    """Derive detector count column names from the configured pipelines."""
+    cfg_init, _ = pp_util.get_preprocess_context(configs_init)
+    cfg_proc, _ = pp_util.get_preprocess_context(configs_proc)
+
+    names = ["starting"]
+
+    pipe_init = Pipeline(cfg_init["process_pipe"])
+    for process in pipe_init:
+        names.append(process.name)
+
+    pipe_proc = Pipeline(cfg_proc["process_pipe"])
+    for process in pipe_proc:
+        names.append(process.name)
+
+    return [f"{i}_{name}" for i, name in enumerate(names)]
+
+
 def create_counts_table(db_path: str, count_names: List[str]):
     """Create the detector counts table with dynamic columns based on process names."""
     conn = sqlite3.connect(db_path)
@@ -72,7 +90,7 @@ def track_det_counts_single(obsid: str,
                            configs_proc: dict,
                            logger,
                            db_path: str,
-                           count_names: List[str] = None,
+                           count_names: Optional[List[str]] = None,
                            run_parallel: bool = False):
     """Track detector counts for a single wafer/band combination."""
     
@@ -131,6 +149,7 @@ def track_det_counts_single(obsid: str,
             cfg_proc, ctx_proc = pp_util.get_preprocess_context(configs_proc)
             ctx_init['metadata'] = ctx_init['metadata'][:-1]
             ctx_proc['metadata'] = ctx_proc['metadata'][:-1]
+            counts_tot = np.zeros(len(count_names))
             
             try:
                 aman = ctx_init.get_obs(obsid, dets=dets)
@@ -148,6 +167,7 @@ def track_det_counts_single(obsid: str,
                     proc_aman.restrict('dets', aman.dets.vals)
                     if aman.dets.count != 0:
                         counts.append(aman.dets.count)
+                        counts_tot[:len(counts)] = counts
                 
                 # Second Layer (proc pipeline)
                 pipe_proc = Pipeline(configs_proc["process_pipe"])
@@ -160,14 +180,15 @@ def track_det_counts_single(obsid: str,
                     proc_aman.restrict('dets', aman.dets.vals)
                     if aman.dets.count != 0:
                         counts.append(aman.dets.count)
-                        
+                        counts_tot[:len(counts)] = counts
                 logger.info(f"{wafer} {band} final count (get_obs): {aman.dets.count}")
                 
             except Exception as e2:
                 logger.error(f"{wafer} {band} failed completely: {e2}")
                 error = f"Both get_meta and get_obs failed for {wafer} {band}"
                 if run_parallel:
-                    return error, None, None
+                    # Want to return count_tot here (but issue right now is count_names must be known in advance)
+                    return error, None
                 else:
                     return
         
@@ -192,12 +213,12 @@ def track_det_counts_single(obsid: str,
         logger.error(f"ERROR: {obsid} {wafer} {band}\n{errmsg}\n{tb}")
         error = errmsg
         if run_parallel:
-            return error, counts_result, count_names
+            return error, counts_result
         else:
             return
     
     if run_parallel:
-        return error, counts_result, count_names
+        return error, counts_result
 
 
 def track_det_counts_obs(obsid: str,
@@ -205,6 +226,7 @@ def track_det_counts_obs(obsid: str,
                         configs_proc,
                         db_path: str,
                         verbosity: int = 2,
+                        count_names: Optional[List[str]] = None,
                         run_parallel: bool = False):
     """Track detector counts for all wafer/band combinations for a single observation."""
     
@@ -215,32 +237,35 @@ def track_det_counts_obs(obsid: str,
     if isinstance(configs_proc, str):
         configs_proc = yaml.safe_load(open(configs_proc, "r"))
     
+    if count_names is None:
+        count_names = build_count_names(configs_init, configs_proc)
+
     outputs = []
-    count_names = None
     
     # Process all wafer/band combinations
     missing_ws_bands = []
     
+    if not run_parallel:
+        create_counts_table(db_path, count_names)
+
     for wsi in range(7):
         ws = f'ws{wsi}'
         for band in ['f090', 'f150']:
             try:
-                error, result, names = track_det_counts_single(
-                    obsid, ws, band, configs_init, configs_proc, 
-                    logger, db_path, count_names, run_parallel
-                )
-                
-                if count_names is None and names is not None:
-                    count_names = names
-                    if not run_parallel:
-                        # Create table on first successful run
-                        create_counts_table(db_path, count_names)
-                
-                if result is not None:
-                    if run_parallel:
+                if run_parallel:
+                    error, result = track_det_counts_single(
+                        obsid, ws, band, configs_init, configs_proc,
+                        logger, db_path, count_names, run_parallel
+                    )
+                    if result is not None and error is None:
                         outputs.append(result)
+                    else:
+                        missing_ws_bands.append((ws, band))
                 else:
-                    missing_ws_bands.append((ws, band))
+                    track_det_counts_single(
+                        obsid, ws, band, configs_init, configs_proc,
+                        logger, db_path, count_names, run_parallel
+                    )
                     
             except Exception as e:
                 logger.error(f"Failed to process {ws} {band}: {e}")
@@ -250,7 +275,7 @@ def track_det_counts_obs(obsid: str,
         logger.warning(f"Missing wafer/band combinations for {obsid}: {missing_ws_bands}")
     
     if run_parallel:
-        return None, outputs, count_names
+        return None, outputs
     
 
 def get_parser(parser=None):
@@ -361,9 +386,11 @@ def _main(executor: Union["MPICommExecutor", "ProcessPoolExecutor"],
         finally:
             conn.close()
 
+    count_names = build_count_names(configs_init, configs_proc)
+    create_counts_table(db_path, count_names)
+
     run_list = [obs for obs in obs_list]
     n_fail = 0
-    count_names = None
 
     # Run observations in parallel
     futures = [executor.submit(track_det_counts_obs, obs['obs_id'],
@@ -371,16 +398,13 @@ def _main(executor: Union["MPICommExecutor", "ProcessPoolExecutor"],
                               configs_proc=configs_proc,
                               db_path=db_path,
                               verbosity=verbosity,
+                              count_names=count_names,
                               run_parallel=True) for obs in run_list]
     
     for future in as_completed_callable(futures):
         logger.info('New future completed')
         try:
-            err, results, names = future.result()
-            
-            if count_names is None and names is not None:
-                count_names = names
-                create_counts_table(db_path, count_names)
+            err, results = future.result()
             
             if err is not None:
                 n_fail += 1
