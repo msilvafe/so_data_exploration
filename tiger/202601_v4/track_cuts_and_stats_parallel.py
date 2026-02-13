@@ -12,14 +12,21 @@ from typing import Optional, Union, Callable, List, Dict, Any
 import numpy as np
 import argparse
 import traceback
-import sqlite3
 from sotodlib.utils.procs_pool import get_exec_env
 from sotodlib import core
+from sotodlib.core.metadata.obsdb import ObsDb
 import sotodlib.site_pipeline.util as sp_util
 from sotodlib.preprocess import preprocess_util as pp_util
+from sotodlib.preprocess import Pipeline
 
 # Import the single observation tracking function
-from track_cuts_and_stats import track_cuts_and_stats, create_cuts_stats_tables, build_process_names, save_results_to_db
+from track_cuts_and_stats import (
+    track_cuts_and_stats,
+    create_cuts_stats_tables,
+    build_process_names,
+    save_results_to_db,
+    get_sorted_flag_labs,
+)
 
 logger = sp_util.init_logger("track_cuts_stats_parallel")
 
@@ -47,8 +54,12 @@ def main():
     with open(args.proc_config, 'r') as f:
         configs_proc = yaml.safe_load(f)
     
-    # Build process names for table creation
+    # Build process names and flag labels for table creation
     process_names = build_process_names(configs_init, configs_proc)
+    cfg_init, _ = pp_util.get_preprocess_context(configs_init)
+    pipe_init = Pipeline(cfg_init["process_pipe"])
+    full_flag_labels = get_sorted_flag_labs(pipe_init)
+    base_flag_labels = [label.split('.')[0] for label in full_flag_labels]
     
     # Get observation list
     cfg_init, context = pp_util.get_preprocess_context(args.init_config)
@@ -75,16 +86,12 @@ def main():
     # Filter existing observations if not overwriting
     if not args.overwrite and os.path.exists(args.db_path):
         try:
-            conn = sqlite3.connect(args.db_path)
-            cursor = conn.cursor()
-            cursor.execute("SELECT DISTINCT obs_id FROM detector_counts")
-            existing_obsids = set([row[0] for row in cursor.fetchall()])
+            obsdb = ObsDb(map_file=args.db_path, init_db=False)
+            existing_obsids = set([row['obs_id'] for row in obsdb.query()])
             obs_list = [obs for obs in obs_list if obs['obs_id'] not in existing_obsids]
             logger.info(f'Filtered to {len(obs_list)} new observations')
-            conn.close()
-        except sqlite3.OperationalError:
-            # Table doesn't exist yet
-            pass
+        except Exception as e:
+            logger.warning(f"Could not filter existing observations: {e}")
     
     # Create tables (only on rank 0)
     try:
@@ -101,7 +108,7 @@ def main():
         comm, rank, size = None, 0, 1
     
     if rank == 0:
-        create_cuts_stats_tables(args.db_path, process_names)
+        create_cuts_stats_tables(args.db_path, process_names, base_flag_labels)
     
     # Wait for table creation
     if comm:
@@ -129,11 +136,12 @@ def main():
                 logger.info(f"Rank {rank} processing {obs_id} {wafer} {band}")
             
             # Track cuts and statistics for this observation
-            results = track_cuts_and_stats(obs_id, wafer, band, configs_init, configs_proc, 
-                                           process_names, args.verbosity)
+            results = track_cuts_and_stats(obs_id, wafer, band, configs_init, configs_proc,
+                                           process_names, full_flag_labels, args.verbosity)
             
             # Save results to database
-            save_results_to_db(args.db_path, obs_id, wafer, band, results, process_names)
+            save_results_to_db(args.db_path, obs_id, wafer, band, results,
+                               process_names, base_flag_labels)
             
             if results['success']:
                 n_processed += 1

@@ -8,8 +8,15 @@ import os
 import yaml
 import sys
 import argparse
-import sqlite3
-from track_cuts_and_stats import track_cuts_and_stats, create_cuts_stats_tables, build_process_names, save_results_to_db
+from sotodlib.preprocess import preprocess_util as pp_util
+from sotodlib.preprocess import Pipeline
+from track_cuts_and_stats import (
+    track_cuts_and_stats,
+    create_cuts_stats_tables,
+    build_process_names,
+    save_results_to_db,
+    get_sorted_flag_labs,
+)
 
 def main():
     parser = argparse.ArgumentParser(description='Track cuts and statistics in parallel via SLURM task array')
@@ -36,8 +43,12 @@ def main():
     with open(args.proc_config, 'r') as f:
         configs_proc = yaml.safe_load(f)
     
-    # Build process names for table creation
+    # Build process names and flag labels for table creation
     process_names = build_process_names(configs_init, configs_proc)
+    cfg_init, _ = pp_util.get_preprocess_context(configs_init)
+    pipe_init = Pipeline(cfg_init["process_pipe"])
+    full_flag_labels = get_sorted_flag_labs(pipe_init)
+    base_flag_labels = [label.split('.')[0] for label in full_flag_labels]
     
     # Load observation list
     with open(args.obs_list, 'r') as f:
@@ -48,7 +59,7 @@ def main():
     # Create tables (only task 0)
     if task_id == 0:
         print("Task 0: Creating database tables...")
-        create_cuts_stats_tables(args.db_path, process_names)
+        create_cuts_stats_tables(args.db_path, process_names, base_flag_labels)
         print("Task 0: Tables created successfully")
     
     # Create work items (obs_id, wafer, band) and distribute across tasks
@@ -74,10 +85,11 @@ def main():
         try:
             # Track cuts and statistics
             results = track_cuts_and_stats(obs_id, wafer, band, configs_init, configs_proc,
-                                           process_names, args.verbosity)
+                                           process_names, full_flag_labels, args.verbosity)
             
             # Save results to database
-            save_results_to_db(args.db_path, obs_id, wafer, band, results, process_names)
+            save_results_to_db(args.db_path, obs_id, wafer, band, results,
+                               process_names, base_flag_labels)
             
             if results['success']:
                 n_processed += 1
