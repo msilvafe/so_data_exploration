@@ -17,12 +17,13 @@ import copy
 from tqdm import tqdm
 from sotodlib import core
 from sotodlib.core import AxisManager
-from so3g.proj import RangesMatrix
-from sotodlib.core.flagman import count_cuts
+from so3g.proj import RangesMatrix, Ranges
+from sotodlib.core.flagman import count_cuts, has_any_cuts
 from sotodlib.core.metadata.obsdb import ObsDb
 import sotodlib.site_pipeline.util as sp_util
 from sotodlib.preprocess import preprocess_util as pp_util
 from sotodlib.preprocess import _Preprocess, Pipeline, processes, pcore
+import h5py
 
 logger = sp_util.init_logger("track_cuts_and_stats")
 
@@ -103,27 +104,31 @@ def build_padded_valid(meta_init, meta_proc):
     if not hasattr(meta_init.preprocess, 'valid_data'):
         return None
     data_valid_init = meta_init.preprocess.valid_data.valid_data
+    
     if meta_proc is None:
         return data_valid_init
     if not hasattr(meta_proc.preprocess, 'valid_data'):
         return data_valid_init
     data_valid_proc = meta_proc.preprocess.valid_data.valid_data
-    if meta_init.dets.count == meta_proc.dets.count:
-        return data_valid_proc
-
+    
+    # Get fill range from init's valid data
     dets_with_valid = np.where(count_cuts(data_valid_init))[0]
     if dets_with_valid.size == 0:
         return RangesMatrix.zeros((meta_init.dets.count, meta_init.samps.count))
     fill_rng = data_valid_init[dets_with_valid[0]].ranges()[0]
 
+    # Find which detectors are valid in proc
     where_valid = count_cuts(data_valid_proc).astype(bool)
     valid_det_names_proc = meta_proc.dets.vals[where_valid]
+    
+    # Find intersection of detector names between init and proc
     _, init_indices, _ = np.intersect1d(
         meta_init.dets.vals,
         valid_det_names_proc,
         return_indices=True
     )
 
+    # Create padded_valid aligned to init's shape, marking proc's valid detectors
     padded_valid = RangesMatrix.zeros((meta_init.dets.count, meta_init.samps.count))
     for init_idx in init_indices:
         padded_valid[init_idx].add_interval(fill_rng[0], fill_rng[1])
@@ -165,10 +170,11 @@ def extract_sample_cuts(meta_init, padded_valid, flag_labs):
             cur_flag = meta_init.preprocess[fl]
         else:
             cur_flag = meta_init.preprocess[fl] * ~prev_flags
+        
         cur_count = count_ranges_matrix_samples(cur_flag * padded_valid)
         sample_cuts[base_label] = cur_count
         if prev_flags is None:
-            prev_flags = copy.deepcopy(cur_flag)
+            prev_flags = cur_flag.copy()
         else:
             prev_flags += cur_flag
     return sample_cuts
@@ -220,7 +226,7 @@ def create_cuts_stats_tables(db_path: str, process_names: List[str], flag_labels
 
     column_defs = []
     for i, name in enumerate(process_names):
-        column_defs.append((f"{i}_{name}_ndets", int))
+        column_defs.append((f"det_{i}_{name}_ndets", int))
 
     column_defs.append(("total_samples", int))
     column_defs.extend([(label, int) for label in flag_labels])
@@ -378,19 +384,15 @@ def pick_noise_save_names(pipe_init, pipe_proc):
     U = choose([r for r in recs if r["signal"] == "demodU"])
 
     def pack(r):
-        """Convert a noise record to (save_name, has_fit, where) tuple.
-        If fit=True, appends the merge_name to the save_name to access the fit statistics.
-        """
+        """Convert a noise record to (save_name, has_fit, where) tuple."""
         if r is None:
             return (None, False, None)
 
-        if r["fit"]:
-            merge_name = r["process"].calc_cfgs.get("merge_name", "noise_fit_stats")
-            save = f"{r['save_name']}.{merge_name}"
-        else:
-            save = r["save_name"]
+        base_name = r['save_name']
+        if not base_name:
+            return (None, False, None)
 
-        return (save, r["fit"], r["where"])
+        return (base_name, r["fit"], r["where"])
 
     return {
         "T": pack(T),
@@ -398,7 +400,8 @@ def pick_noise_save_names(pipe_init, pipe_proc):
         "U": pack(U),
     }
 
-def extract_statistics(aman_init, aman_proc, pipe_init, pipe_proc):
+def extract_statistics(aman_init, aman_proc, pipe_init, pipe_proc, return_aggregate_data=False, wafer=None,
+                      restrict_final_cuts=False, padded_valid=None, proc_valid_data=None, verbosity=0):
     """Extract noise and T2P statistics from processed data.
 
     Parameters
@@ -411,14 +414,29 @@ def extract_statistics(aman_init, aman_proc, pipe_init, pipe_proc):
         Init pipeline used to infer noise locations.
     pipe_proc : sotodlib.preprocess.Pipeline or None
         Proc pipeline used to infer noise locations.
+    return_aggregate_data : bool
+        If True, also return white_noise arrays and detector IDs for aggregation.
+    wafer : str or None
+        Wafer slot name (e.g., 'ws0', 'ws1') for aggregation. Required if return_aggregate_data is True.
+    restrict_final_cuts : bool
+        If True, only compute statistics for detectors with valid data.
+    padded_valid : RangesMatrix or None
+        Valid data ranges for init pipeline detectors. Required if restrict_final_cuts is True.
+    proc_valid_data : RangesMatrix or None
+        Valid data ranges for proc pipeline detectors. Required if restrict_final_cuts is True.
+    verbosity : int, optional
+        Verbosity level for debug logging.
 
     Returns
     -------
-    tuple of dict
-        Noise statistics and T2P statistics dictionaries.
+    tuple
+        (noise_stats, t2p_stats, aggregate_data) where aggregate_data is None if
+        return_aggregate_data is False, otherwise a dict with T/Q/U keys mapping to
+        dicts containing 'white_noise', 'det_ids', and 'wafer_slots' arrays.
     """
     noise_stats = {}
     t2p_stats = {}
+    aggregate_data = {} if return_aggregate_data else None
 
     # Determine which noise outputs to use
     noise_map = pick_noise_save_names(pipe_init, pipe_proc)
@@ -433,37 +451,64 @@ def extract_statistics(aman_init, aman_proc, pipe_init, pipe_proc):
         if aman is None:
             continue
 
+        # Debug: print what we're looking for
+        if verbosity >= 2:
+            logger.info(f"Looking for {pol} noise at: '{save_name}' (has_fit={has_fit}, where={where})")
+
         # Get the noise object
         noise_obj = aman[save_name]
+        
+        # Filter to detectors with valid data if requested
+        if restrict_final_cuts:
+            # Select appropriate valid_data based on where the data is from
+            valid_data = padded_valid if where == 'init' else proc_valid_data
+            if valid_data is not None:
+                # Use has_any_cuts to create boolean mask of detectors with valid data
+                det_mask = has_any_cuts(valid_data)
+                if not np.any(det_mask):
+                    # No detectors survived, skip this polarization
+                    continue
+                white_noise = noise_obj.white_noise[det_mask]
+                if has_fit:
+                    fit_data = noise_obj.fit[det_mask]
+            else:
+                # No valid_data available, use all detectors
+                white_noise = noise_obj.white_noise
+                if has_fit:
+                    fit_data = noise_obj.fit
+        else:
+            white_noise = noise_obj.white_noise
+            if has_fit:
+                fit_data = noise_obj.fit
 
         noise_data = {}
         
         # Always extract white noise
-        wn_quantiles = get_quantiles(noise_obj.white_noise)
+        wn_quantiles = get_quantiles(white_noise)
         noise_data.update({
-            'white_noise_avg': np.nanmean(noise_obj.white_noise),
+            'white_noise_avg': np.nanmean(white_noise),
             'white_noise_q10': wn_quantiles[0],
             'white_noise_q25': wn_quantiles[1],
             'white_noise_q50': wn_quantiles[2],
             'white_noise_q75': wn_quantiles[3],
             'white_noise_q90': wn_quantiles[4],
-            'array_noise': 1/np.sqrt(np.nansum(1/np.array(noise_obj.white_noise)**2)),
-            'n_array_noise': len(noise_obj.white_noise),
+            'array_noise': 1/np.sqrt(np.nansum(1/np.array(white_noise)**2)),
+            'n_array_noise': len(white_noise),
         })
 
         # Extract fit parameters if available
         if has_fit:
-            fknee_quantiles = get_quantiles(noise_obj.fit[:, 1])
-            alpha_quantiles = get_quantiles(noise_obj.fit[:, 2])
+            fknee_quantiles = get_quantiles(fit_data[:, 1])
+            alpha_quantiles = get_quantiles(fit_data[:, 2])
 
             noise_data.update({
-                'fknee_avg': np.nanmean(noise_obj.fit[:, 1]),
+                'fknee_avg': np.nanmean(fit_data[:, 1]),
                 'fknee_q10': fknee_quantiles[0],
                 'fknee_q25': fknee_quantiles[1],
                 'fknee_q50': fknee_quantiles[2],
                 'fknee_q75': fknee_quantiles[3],
                 'fknee_q90': fknee_quantiles[4],
-                'alpha_avg': np.nanmean(noise_obj.fit[:, 2]),
+                'alpha_avg': np.nanmean(fit_data[:, 2]),
                 'alpha_q10': alpha_quantiles[0],
                 'alpha_q25': alpha_quantiles[1],
                 'alpha_q50': alpha_quantiles[2],
@@ -487,27 +532,107 @@ def extract_statistics(aman_init, aman_proc, pipe_init, pipe_proc):
             })
 
         noise_stats[pol] = noise_data
+        
+        # Collect aggregation data if requested
+        if return_aggregate_data and save_name is not None:
+            # Get detector names and white noise (possibly filtered)
+            if restrict_final_cuts:
+                valid_data = padded_valid if where == 'init' else proc_valid_data
+                if valid_data is not None:
+                    det_mask = has_any_cuts(valid_data)
+                    det_names = aman.dets.vals[det_mask]
+                    wn_to_aggregate = white_noise
+                else:
+                    det_names = aman.dets.vals
+                    wn_to_aggregate = noise_obj.white_noise
+            else:
+                det_names = aman.dets.vals
+                wn_to_aggregate = noise_obj.white_noise
+            
+            # Extract wafer slot number from wafer string (e.g., "ws0" -> 0)
+            wafer_slot = int(wafer.replace('ws', '')) if wafer and wafer.startswith('ws') else 0
+            wafer_slots = np.full(len(det_names), wafer_slot, dtype=np.int32)
+            
+            aggregate_data[pol] = {
+                'white_noise': np.array(wn_to_aggregate, dtype=float),
+                'det_ids': np.array(det_names, dtype=str),
+                'wafer_slots': wafer_slots,
+            }
 
     # Extract T2P statistics
     if aman_proc and hasattr(aman_proc, 't2p'):
-        if hasattr(aman_proc.t2p, 'coeffsQ'):
-            t2p_stats['coeffsQ_avg'] = np.nanmean(aman_proc.t2p.coeffsQ)
-        if hasattr(aman_proc.t2p, 'coeffsU'):
-            t2p_stats['coeffsU_avg'] = np.nanmean(aman_proc.t2p.coeffsU)
-        if hasattr(aman_proc.t2p, 'errorsQ'):
-            t2p_stats['errorsQ_avg'] = np.nanmean(aman_proc.t2p.errorsQ)
-        if hasattr(aman_proc.t2p, 'errorsU'):
-            t2p_stats['errorsU_avg'] = np.nanmean(aman_proc.t2p.errorsU)
-        if hasattr(aman_proc.t2p, 'redchi2sQ'):
-            t2p_stats['redchi2sQ_avg'] = np.nanmean(aman_proc.t2p.redchi2sQ)
-        if hasattr(aman_proc.t2p, 'redchi2sU'):
-            t2p_stats['redchi2sU_avg'] = np.nanmean(aman_proc.t2p.redchi2sU)
+        # Filter T2P stats to detectors with valid data if requested
+        if restrict_final_cuts and proc_valid_data is not None:
+            det_mask = has_any_cuts(proc_valid_data)
+            if hasattr(aman_proc.t2p, 'coeffsQ'):
+                t2p_stats['coeffsQ_avg'] = np.nanmean(aman_proc.t2p.coeffsQ[det_mask])
+            if hasattr(aman_proc.t2p, 'coeffsU'):
+                t2p_stats['coeffsU_avg'] = np.nanmean(aman_proc.t2p.coeffsU[det_mask])
+            if hasattr(aman_proc.t2p, 'errorsQ'):
+                t2p_stats['errorsQ_avg'] = np.nanmean(aman_proc.t2p.errorsQ[det_mask])
+            if hasattr(aman_proc.t2p, 'errorsU'):
+                t2p_stats['errorsU_avg'] = np.nanmean(aman_proc.t2p.errorsU[det_mask])
+            if hasattr(aman_proc.t2p, 'redchi2sQ'):
+                t2p_stats['redchi2sQ_avg'] = np.nanmean(aman_proc.t2p.redchi2sQ[det_mask])
+            if hasattr(aman_proc.t2p, 'redchi2sU'):
+                t2p_stats['redchi2sU_avg'] = np.nanmean(aman_proc.t2p.redchi2sU[det_mask])
+        else:
+            if hasattr(aman_proc.t2p, 'coeffsQ'):
+                t2p_stats['coeffsQ_avg'] = np.nanmean(aman_proc.t2p.coeffsQ)
+            if hasattr(aman_proc.t2p, 'coeffsU'):
+                t2p_stats['coeffsU_avg'] = np.nanmean(aman_proc.t2p.coeffsU)
+            if hasattr(aman_proc.t2p, 'errorsQ'):
+                t2p_stats['errorsQ_avg'] = np.nanmean(aman_proc.t2p.errorsQ)
+            if hasattr(aman_proc.t2p, 'errorsU'):
+                t2p_stats['errorsU_avg'] = np.nanmean(aman_proc.t2p.errorsU)
+            if hasattr(aman_proc.t2p, 'redchi2sQ'):
+                t2p_stats['redchi2sQ_avg'] = np.nanmean(aman_proc.t2p.redchi2sQ)
+            if hasattr(aman_proc.t2p, 'redchi2sU'):
+                t2p_stats['redchi2sU_avg'] = np.nanmean(aman_proc.t2p.redchi2sU)
 
-    return noise_stats, t2p_stats
+    return noise_stats, t2p_stats, aggregate_data
+
+def write_band_noise_to_hdf5(band_data, band, output_path):
+    """Write band-level aggregated noise data to HDF5 file.
+
+    Parameters
+    ----------
+    band_data : dict
+        Aggregated data dict with 'white_noise', 'det_ids', 'wafer_slots', 'obs_ranges', 'obs_ids'.
+    band : str
+        Band name.
+    output_path : str
+        Path to output HDF5 file.
+    """
+    with h5py.File(output_path, 'w') as f:
+        # Write main arrays
+        f.create_dataset('white_noise', data=band_data['white_noise'], compression='gzip')
+        
+        # Use fixed-length strings (24 chars for detector names like "sch_ufm_mv19_1717342082_2_339")
+        dt = h5py.string_dtype(encoding='utf-8', length=24)
+        f.create_dataset('det_ids', data=band_data['det_ids'].astype(str), dtype=dt, compression='gzip')
+        
+        f.create_dataset('wafer_slots', data=band_data['wafer_slots'], compression='gzip')
+        
+        # Store obs_ranges as separate start/end arrays with obs_id index
+        obs_ids = band_data['obs_ids']
+        obs_starts = np.array([band_data['obs_ranges'][oid][0] for oid in obs_ids], dtype=np.int64)
+        obs_ends = np.array([band_data['obs_ranges'][oid][1] for oid in obs_ids], dtype=np.int64)
+        
+        # Use variable-length strings for observation IDs
+        dt_obs = h5py.string_dtype(encoding='utf-8')
+        f.create_dataset('obs_ids', data=np.array(obs_ids, dtype=str), dtype=dt_obs)
+        f.create_dataset('obs_starts', data=obs_starts)
+        f.create_dataset('obs_ends', data=obs_ends)
+        
+        # Add metadata
+        f.attrs['band'] = band
+        f.attrs['n_total_dets'] = len(band_data['det_ids'])
+        f.attrs['n_obs'] = len(obs_ids)
 
 def track_cuts_and_stats(obsid: str, wafer: str, band: str, configs_init: dict, configs_proc: dict,
                         process_names: Optional[List[str]] = None, flag_labels: Optional[List[str]] = None,
-                        verbosity: int = 0):
+                        verbosity: int = 0, aggregate_noise: str = None, restrict_final_cuts: bool = False):
     """Track detector counts, sample cuts, and statistics for one observation.
 
     Parameters
@@ -528,11 +653,16 @@ def track_cuts_and_stats(obsid: str, wafer: str, band: str, configs_init: dict, 
         Ordered full sample-flag labels for cut counting.
     verbosity : int, optional
         Verbosity level.
+    aggregate_noise : str or None
+        If specified ('T', 'Q', or 'U'), also return aggregated noise data.
+    restrict_final_cuts : bool, optional
+        If True, compute statistics only for detectors that survived all pipeline cuts.
 
     Returns
     -------
     dict
         Results including counts, statistics, and failure metadata.
+        If aggregate_noise is specified, also includes 'aggregate_data' key.
     """
     
     if verbosity >= 1:
@@ -622,9 +752,20 @@ def track_cuts_and_stats(obsid: str, wafer: str, band: str, configs_init: dict, 
             padded_valid = build_padded_valid(aman, meta_proc)
             sample_cuts = extract_sample_cuts(aman, padded_valid, flag_labels)
             
-            # Extract statistics
+            # Extract statistics and optionally aggregation data
             pipe_proc_for_stats = pipe_proc if cfg_proc else None
-            noise_stats, t2p_stats = extract_statistics(aman_init_final, aman_proc_final, pipe_init, pipe_proc_for_stats)
+            proc_valid = meta_proc.preprocess.valid_data.valid_data if meta_proc and hasattr(meta_proc.preprocess, 'valid_data') else None
+            noise_stats, t2p_stats, aggregate_data_all_pols = extract_statistics(
+                aman_init_final, aman_proc_final, pipe_init, pipe_proc_for_stats, 
+                return_aggregate_data=(aggregate_noise is not None), wafer=wafer,
+                restrict_final_cuts=restrict_final_cuts, padded_valid=padded_valid, proc_valid_data=proc_valid,
+                verbosity=verbosity
+            )
+            
+            # Filter aggregation data to requested polarization only
+            aggregate_data = None
+            if aggregate_noise is not None and aggregate_data_all_pols and aggregate_noise in aggregate_data_all_pols:
+                aggregate_data = aggregate_data_all_pols[aggregate_noise]
             
             return {
                 'success': True,
@@ -633,81 +774,35 @@ def track_cuts_and_stats(obsid: str, wafer: str, band: str, configs_init: dict, 
                 'sample_cuts': sample_cuts,
                 'noise_stats': noise_stats,
                 't2p_stats': t2p_stats,
+                'aggregate_data': aggregate_data,
                 'failure_step': None,
                 'error_message': None
             }
             
         except Exception as e:
-            # Fallback to get_obs method with full processing
-            logger.warning(f"{wafer} {band} get_meta failed, trying get_obs: {e}")
-            
-            # Reset contexts and modify metadata
-            cfg_init, ctx_init = pp_util.get_preprocess_context(configs_init)
-            cfg_proc, ctx_proc = pp_util.get_preprocess_context(configs_proc) if configs_proc else (None, None)
-            ctx_init['metadata'] = ctx_init['metadata'][:-1]
-            
-            aman = ctx_init.get_obs(obsid, dets=dets, no_signal=True)
-            initial_det_count = aman.dets.count
-            initial_sample_count = aman.samps.count if hasattr(aman, 'samps') else 0
-            det_counts.append(initial_det_count)
-            
-            # Run pipelines with full processing
-            proc_aman_init = aman.preprocess.copy()
-            pipe_init = Pipeline(cfg_init["process_pipe"])
-            if not flag_labels:
-                flag_labels = get_sorted_flag_labs(pipe_init)
-            
-            for i, process in enumerate(pipe_init):
-                process.select(aman, proc_aman_init)
-                if first_time:
-                    names.append(process.name)
-                det_counts.append(aman.dets.count)
-            
-            # Store init results and continue with proc if configured
-            aman_init_final = proc_aman_init
-            aman_proc_final = None
-            meta_proc = None
-            
-            if cfg_proc:
-                try:
-                    ctx_proc['metadata'] = ctx_proc['metadata'][:-1]
-                    meta_proc = ctx_proc.get_obs(obsid, dets=dets, no_signal=True)
-                    proc_aman_init.move('valid_data', None)
-                    proc_aman_init.merge(meta_proc.preprocess)
-                    pipe_proc = Pipeline(cfg_proc["process_pipe"])
-                    
-                    for i, process in enumerate(pipe_proc):
-                        process.select(aman, proc_aman_init)
-                        if first_time:
-                            names.append(process.name)
-                        det_counts.append(aman.dets.count)
-                    
-                    aman_proc_final = proc_aman_init
-                    
-                except Exception as e2:
-                    logger.warning(f"Proc pipeline failed in fallback for {obsid} {wafer} {band}: {e2}")
-                    # Fill remaining det_counts
-                    if configs_proc and first_time:
-                        pipe_proc = Pipeline(cfg_proc["process_pipe"])
-                        for process in pipe_proc:
-                            names.append(process.name)
-                            det_counts.append(aman.dets.count)
-            
-            # Extract sample cuts and statistics
-            padded_valid = build_padded_valid(aman, meta_proc)
-            sample_cuts = extract_sample_cuts(aman, padded_valid, flag_labels)
-            pipe_proc_for_stats = pipe_proc if cfg_proc else None
-            noise_stats, t2p_stats = extract_statistics(aman_init_final, aman_proc_final, pipe_init, pipe_proc_for_stats)
+            # Check if this is a metadata missing error
+            from sotodlib.core.metadata.loader import LoaderError
+            if isinstance(e, LoaderError):
+                error_msg = f"No metadata found for {obsid} {wafer} {band}"
+                logger.error(error_msg)
+                failure_step = 'metadata'
+            else:
+                error_msg = f"Failed to process {obsid} {wafer} {band}: {str(e)}"
+                logger.error(error_msg)
+                failure_step = 'processing'
+                if verbosity >= 2:
+                    logger.error(traceback.format_exc())
             
             return {
-                'success': True,
-                'process_names': names if first_time else None,
-                'det_counts': det_counts,
-                'sample_cuts': sample_cuts,
-                'noise_stats': noise_stats,
-                't2p_stats': t2p_stats,
-                'failure_step': None,
-                'error_message': None
+                'success': False,
+                'process_names': None,
+                'det_counts': [],
+                'sample_cuts': {},
+                'noise_stats': {},
+                't2p_stats': {},
+                'aggregate_data': None,
+                'failure_step': failure_step,
+                'error_message': error_msg
             }
                 
     except Exception as e:
@@ -723,12 +818,13 @@ def track_cuts_and_stats(obsid: str, wafer: str, band: str, configs_init: dict, 
             'sample_cuts': {},
             'noise_stats': {},
             't2p_stats': {},
+            'aggregate_data': None,
             'failure_step': 'unknown',
             'error_message': error_msg
         }
 
 def save_results_to_db(db_path: str, obs_id: str, wafer: str, band: str, results: dict,
-                       process_names: List[str], flag_labels: List[str]):
+                       process_names: List[str], flag_labels: List[str], commit=True):
     """Save results to the SQLite database.
 
     Parameters
@@ -747,6 +843,10 @@ def save_results_to_db(db_path: str, obs_id: str, wafer: str, band: str, results
         Process name list for detector count columns.
     flag_labels : list
         Ordered base sample-flag labels for sample cut columns.
+    commit : bool
+        Whether to commit immediately to the database. Default is True.
+        For batched operations on distributed filesystems, pass False
+        and manage commits externally to reduce I/O overhead.
     """
     obsdb = ObsDb(map_file=db_path, init_db=False)
 
@@ -758,7 +858,7 @@ def save_results_to_db(db_path: str, obs_id: str, wafer: str, band: str, results
 
     det_counts = results.get('det_counts', [])
     for i, name in enumerate(process_names):
-        key = f"det_{i}_{name}"
+        key = f"det_{i}_{name}_ndets"
         data[key] = det_counts[i] if i < len(det_counts) else None
 
     sample_cuts = results.get('sample_cuts', {})
@@ -805,7 +905,7 @@ def save_results_to_db(db_path: str, obs_id: str, wafer: str, band: str, results
     ]:
         data[f"t2p_{metric}"] = t2p_stats.get(metric)
 
-    obsdb.update_obs(obs_id, data=data, wafer_info={'wafer': wafer, 'band': band}, commit=True)
+    obsdb.update_obs(obs_id, data=data, wafer_info={'wafer': wafer, 'band': band}, commit=commit)
 
 def main():
     """CLI entry point."""
