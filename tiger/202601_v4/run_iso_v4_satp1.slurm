@@ -1,48 +1,56 @@
 #!/bin/bash
 #SBATCH --job-name=iso_v4_satp1
-#SBATCH --nodes=18
-#SBATCH --ntasks-per-node=56
-#SBATCH --cpus-per-task=2
-#SBATCH --time=4:00:00
+#SBATCH --nodes=16
+#SBATCH --ntasks-per-node=112
+#SBATCH --cpus-per-task=1
+#SBATCH --time=01:05:00
 #SBATCH --output=%x_%j.log
 #SBATCH --error=%x_%j.err
 #SBATCH --account=simonsobs
 #SBATCH --mail-type=END,FAIL
 #SBATCH --mail-user=maximiliano.silva-feaver@yale.edu
 
-# Run iso-v4 processing for SATPv1 across multiple nodes on Tiger
+# Run iso-v4 processing for SATPv1 using sotodlib get_exec_env (MPI/process-pool)
 # Full observatory preprocessing for all SATp1 observations with batched database commits
 
-set -e
-
-# Source bashrc to get environment
-source ~/.bashrc
-
-# Load necessary modules
-module load openmpi/gcc
-
 # Set OpenMP threads to match cpus-per-task to prevent oversubscription
-export OMP_NUM_THREADS=2
+export OMP_NUM_THREADS=1
 
 # Configuration
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-OUTPUT_BASE="/scratch/gpfs/SIMONSOBS/users/ms3067/iso_stats/v4_tests/satp1"
+BASE_DIR="${HOME}/repos/iso-sat/v4"
+SCRIPT_PATH="/home/ms3067/so_data_exploration/tiger/202601_v4/track_cuts_and_stats_parallel.py"
+SAT_TAG="satp1"
+
+# Config and observation list paths
+INIT_CONFIG="${BASE_DIR}/preprocessing/satp1/preprocessing_config_20260417_init.yaml"
+PROC_CONFIG="${BASE_DIR}/preprocessing/satp1/preprocessing_config_20260417_proc.yaml"
+OBS_LIST="${BASE_DIR}/preprocessing/satp1/listv4.txt"
+
+# Derive version number from proc config name, e.g. preprocessing_config_20260417_proc.yaml -> satp1_20260417
+PROC_BASENAME="$(basename "${PROC_CONFIG}")"
+DATE_TAG="${PROC_BASENAME#preprocessing_config_}"
+DATE_TAG="${DATE_TAG%_proc.yaml}"
+VERSION_NUMBER="${SAT_TAG}_${DATE_TAG}"
+
+OUTPUT_BASE="/scratch/gpfs/SIMONSOBS/sat-iso/v4/cuts_stats/${VERSION_NUMBER}"
 DB_DIR="${OUTPUT_BASE}/databases"
 AGG_DIR="${OUTPUT_BASE}/aggregation"
 LOG_DIR="${OUTPUT_BASE}/logs"
-
-# Config and observation list paths
-INIT_CONFIG="preprocessing/satp1/preprocessing_config_20251216_init.yaml"
-PROC_CONFIG="preprocessing/satp1/preprocessing_config_20251216_proc.yaml"
-OBS_LIST="preprocessing/satp1/listv4.txt"
-DB_PATH="${DB_DIR}/iso_v4_satp1.sqlite"
+DB_PATH="${DB_DIR}/iso_v4_${VERSION_NUMBER}.sqlite"
 
 # Create output directories
 mkdir -p "${DB_DIR}" "${AGG_DIR}" "${LOG_DIR}"
 
+if ! cd "${BASE_DIR}"; then
+    echo "[$(date)] Failed to cd to base directory: ${BASE_DIR}"
+    exit 1
+fi
+
 echo "=========================================="
 echo "ISO-V4 Processing for SATPv1"
 echo "=========================================="
+echo "Version number: ${VERSION_NUMBER}"
+echo "Run base directory: ${BASE_DIR}"
 echo "Output base: ${OUTPUT_BASE}"
 echo "Database: ${DB_PATH}"
 echo "Aggregation: ${AGG_DIR}"
@@ -51,38 +59,34 @@ echo "Job ID: ${SLURM_JOB_ID}"
 echo "Nodes: ${SLURM_NNODES}, Tasks: ${SLURM_NTASKS}, CPUs per task: ${SLURM_CPUS_PER_TASK}"
 echo "=========================================="
 
-# Start processing with MPI
-echo "[$(date)] Starting MPI-based parallel processing..."
+# Start processing
+echo "[$(date)] Starting get_exec_env-based parallel processing..."
+echo "Allocated: ${SLURM_NNODES} node(s), ${SLURM_CPUS_ON_NODE} CPUs"
 
-mpirun -np ${SLURM_NTASKS} python3 "${SCRIPT_DIR}/track_cuts_and_stats_parallel.py" \
+LAUNCH_STR="srun -n ${SLURM_NTASKS} --cpus-per-task=${SLURM_CPUS_PER_TASK} --export=ALL"
+
+echo "Launch string: ${LAUNCH_STR}"
+
+${LAUNCH_STR} python3 "${SCRIPT_PATH}" \
     --init-config "${INIT_CONFIG}" \
     --proc-config "${PROC_CONFIG}" \
     --obs-list "${OBS_LIST}" \
     --db-path "${DB_PATH}" \
     --batch-size 100 \
     --verbosity 1 \
-    --aggregate-noise T \
+    --nprocs ${SLURM_NTASKS} \
+    --aggregate-noise Q \
     --aggregate-output "${AGG_DIR}/noise_aggregation" \
     2>&1 | tee "${LOG_DIR}/processing_${SLURM_JOB_ID}.log"
 
 PROCESS_STATUS=$?
 
-if [ $PROCESS_STATUS -eq 0 ]; then
-    echo "[$(date)] Main processing completed successfully"
-    
-    # Post-processing: combine aggregation files by band
-    echo "[$(date)] Starting post-processing..."
-    python3 "${SCRIPT_DIR}/combine_aggregation_files.py" \
-        --aggregation-dir "${AGG_DIR}" \
-        --output-dir "${AGG_DIR}" \
-        --bands f090,f150 \
-        2>&1 | tee -a "${LOG_DIR}/processing_${SLURM_JOB_ID}.log"
-    
-    echo "[$(date)] Post-processing completed"
-else
+if [ $PROCESS_STATUS -ne 0 ]; then
     echo "[$(date)] Main processing failed with status $PROCESS_STATUS"
     exit $PROCESS_STATUS
 fi
+
+echo "[$(date)] Processing completed successfully"
 
 # Final summary
 echo "=========================================="

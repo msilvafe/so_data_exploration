@@ -221,8 +221,15 @@ def create_cuts_stats_tables(db_path: str, process_names: List[str], flag_labels
         Ordered list of process names for detector count columns.
     flag_labels : list
         Ordered list of sample-flag labels for sample cut columns.
+    
+    Returns
+    -------
+    ObsDb
+        Opened database connection for reuse.
     """
-    obsdb = ObsDb(map_file=db_path, init_db=True, wafer_info=['wafer', 'band'])
+    # Check if database already exists; if so, just open it without re-initializing
+    db_exists = os.path.exists(db_path)
+    obsdb = ObsDb(map_file=db_path, init_db=not db_exists, wafer_info=['wafer', 'band'])
 
     column_defs = []
     for i, name in enumerate(process_names):
@@ -273,6 +280,7 @@ def create_cuts_stats_tables(db_path: str, process_names: List[str], flag_labels
     column_defs.append(("error_message", str))
 
     obsdb.add_obs_columns(column_defs, ignore_duplicates=True, commit=True)
+    return obsdb
 
 def pick_noise_save_names(pipe_init, pipe_proc):
     """Infer which noise process outputs to use for T, Q, U statistics.
@@ -608,9 +616,10 @@ def write_band_noise_to_hdf5(band_data, band, output_path):
         # Write main arrays
         f.create_dataset('white_noise', data=band_data['white_noise'], compression='gzip')
         
-        # Use fixed-length strings (24 chars for detector names like "sch_ufm_mv19_1717342082_2_339")
-        dt = h5py.string_dtype(encoding='utf-8', length=24)
-        f.create_dataset('det_ids', data=band_data['det_ids'].astype(str), dtype=dt, compression='gzip')
+        # Use variable-length UTF-8 strings; fixed-length fields can fail if detector IDs are longer.
+        dt = h5py.string_dtype(encoding='utf-8')
+        det_ids = np.asarray(band_data['det_ids'], dtype=object)
+        f.create_dataset('det_ids', data=det_ids, dtype=dt, compression='gzip')
         
         f.create_dataset('wafer_slots', data=band_data['wafer_slots'], compression='gzip')
         
@@ -619,9 +628,8 @@ def write_band_noise_to_hdf5(band_data, band, output_path):
         obs_starts = np.array([band_data['obs_ranges'][oid][0] for oid in obs_ids], dtype=np.int64)
         obs_ends = np.array([band_data['obs_ranges'][oid][1] for oid in obs_ids], dtype=np.int64)
         
-        # Use variable-length strings for observation IDs
-        dt_obs = h5py.string_dtype(encoding='utf-8')
-        f.create_dataset('obs_ids', data=np.array(obs_ids, dtype=str), dtype=dt_obs)
+        # Use variable-length UTF-8 strings for observation IDs
+        f.create_dataset('obs_ids', data=np.asarray(obs_ids, dtype=object), dtype=dt)
         f.create_dataset('obs_starts', data=obs_starts)
         f.create_dataset('obs_ends', data=obs_ends)
         
@@ -632,7 +640,8 @@ def write_band_noise_to_hdf5(band_data, band, output_path):
 
 def track_cuts_and_stats(obsid: str, wafer: str, band: str, configs_init: dict, configs_proc: dict,
                         process_names: Optional[List[str]] = None, flag_labels: Optional[List[str]] = None,
-                        verbosity: int = 0, aggregate_noise: str = None, restrict_final_cuts: bool = False):
+                        verbosity: int = 0, aggregate_noise: str = None, restrict_final_cuts: bool = False,
+                        profile_timing: bool = False):
     """Track detector counts, sample cuts, and statistics for one observation.
 
     Parameters
@@ -663,15 +672,32 @@ def track_cuts_and_stats(obsid: str, wafer: str, band: str, configs_init: dict, 
     dict
         Results including counts, statistics, and failure metadata.
         If aggregate_noise is specified, also includes 'aggregate_data' key.
+        If profile_timing is True, includes 'timing_breakdown_s' key.
     """
+
+    total_start = time.time()
+    timing_breakdown = {
+        'setup_context_s': 0.0,
+        'get_meta_init_s': 0.0,
+        'init_pipeline_total_s': 0.0,
+        'init_process_s': {},
+        'get_meta_proc_s': 0.0,
+        'proc_pipeline_total_s': 0.0,
+        'proc_process_s': {},
+        'build_valid_and_sample_cuts_s': 0.0,
+        'extract_statistics_s': 0.0,
+        'total_s': 0.0,
+    }
     
     if verbosity >= 1:
         logger.info(f"Processing {obsid} {wafer} {band}")
     
     try:
         # Initialize contexts
+        t0 = time.time()
         cfg_init, ctx_init = pp_util.get_preprocess_context(configs_init)
         cfg_proc, ctx_proc = pp_util.get_preprocess_context(configs_proc) if configs_proc else (None, None)
+        timing_breakdown['setup_context_s'] = time.time() - t0
         
         dets = {'wafer_slot': wafer, 'wafer.bandpass': band}
         det_counts = []
@@ -687,7 +713,9 @@ def track_cuts_and_stats(obsid: str, wafer: str, band: str, configs_init: dict, 
             
         try:
             # First attempt with get_meta (preferred method)
+            t0 = time.time()
             aman = ctx_init.get_meta(obsid, dets=dets)
+            timing_breakdown['get_meta_init_s'] = time.time() - t0
             initial_det_count = aman.dets.count
             initial_sample_count = aman.samps.count if hasattr(aman, 'samps') else 0
             det_counts.append(initial_det_count)
@@ -701,15 +729,19 @@ def track_cuts_and_stats(obsid: str, wafer: str, band: str, configs_init: dict, 
             if not flag_labels:
                 flag_labels = get_sorted_flag_labs(pipe_init)
             
+            t0_init_pipeline = time.time()
             for i, process in enumerate(pipe_init):
+                t0_process = time.time()
                 process.select(aman, proc_aman_init)
                 proc_aman_init.restrict('dets', aman.dets.vals)
+                timing_breakdown['init_process_s'][f"{i:02d}_{process.name}"] = time.time() - t0_process
                 if first_time:
                     names.append(process.name)
                 det_counts.append(aman.dets.count)
                 
                 if verbosity >= 2:
                     logger.info(f"After {process.name}: {aman.dets.count} dets")
+            timing_breakdown['init_pipeline_total_s'] = time.time() - t0_init_pipeline
             
             # Store references to the processed data for statistics extraction
             aman_init_final = proc_aman_init
@@ -719,20 +751,26 @@ def track_cuts_and_stats(obsid: str, wafer: str, band: str, configs_init: dict, 
             meta_proc = None
             if cfg_proc:
                 try:
+                    t0 = time.time()
                     meta_proc = ctx_proc.get_meta(obsid, dets=dets)
+                    timing_breakdown['get_meta_proc_s'] = time.time() - t0
                     proc_aman_init.move('valid_data', None)
                     proc_aman_init.merge(meta_proc.preprocess)
                     pipe_proc = Pipeline(cfg_proc["process_pipe"])
                     
+                    t0_proc_pipeline = time.time()
                     for i, process in enumerate(pipe_proc):
+                        t0_process = time.time()
                         process.select(aman, proc_aman_init)
                         proc_aman_init.restrict('dets', aman.dets.vals)
+                        timing_breakdown['proc_process_s'][f"{i:02d}_{process.name}"] = time.time() - t0_process
                         if first_time:
                             names.append(process.name)
                         det_counts.append(aman.dets.count)
                         
                         if verbosity >= 2:
                             logger.info(f"After {process.name}: {aman.dets.count} dets")
+                    timing_breakdown['proc_pipeline_total_s'] = time.time() - t0_proc_pipeline
                     
                     aman_proc_final = proc_aman_init
                     
@@ -749,24 +787,29 @@ def track_cuts_and_stats(obsid: str, wafer: str, band: str, configs_init: dict, 
                 logger.info(f"{wafer} {band} final count: {aman.dets.count}")
             
             # Extract sample cuts based on combine_flags ordering
+            t0 = time.time()
             padded_valid = build_padded_valid(aman, meta_proc)
             sample_cuts = extract_sample_cuts(aman, padded_valid, flag_labels)
+            timing_breakdown['build_valid_and_sample_cuts_s'] = time.time() - t0
             
             # Extract statistics and optionally aggregation data
             pipe_proc_for_stats = pipe_proc if cfg_proc else None
             proc_valid = meta_proc.preprocess.valid_data.valid_data if meta_proc and hasattr(meta_proc.preprocess, 'valid_data') else None
+            t0 = time.time()
             noise_stats, t2p_stats, aggregate_data_all_pols = extract_statistics(
                 aman_init_final, aman_proc_final, pipe_init, pipe_proc_for_stats, 
                 return_aggregate_data=(aggregate_noise is not None), wafer=wafer,
                 restrict_final_cuts=restrict_final_cuts, padded_valid=padded_valid, proc_valid_data=proc_valid,
                 verbosity=verbosity
             )
+            timing_breakdown['extract_statistics_s'] = time.time() - t0
             
             # Filter aggregation data to requested polarization only
             aggregate_data = None
             if aggregate_noise is not None and aggregate_data_all_pols and aggregate_noise in aggregate_data_all_pols:
                 aggregate_data = aggregate_data_all_pols[aggregate_noise]
             
+            timing_breakdown['total_s'] = time.time() - total_start
             return {
                 'success': True,
                 'process_names': names if first_time else None,
@@ -776,7 +819,8 @@ def track_cuts_and_stats(obsid: str, wafer: str, band: str, configs_init: dict, 
                 't2p_stats': t2p_stats,
                 'aggregate_data': aggregate_data,
                 'failure_step': None,
-                'error_message': None
+                'error_message': None,
+                'timing_breakdown_s': timing_breakdown if profile_timing else None,
             }
             
         except Exception as e:
@@ -793,6 +837,7 @@ def track_cuts_and_stats(obsid: str, wafer: str, band: str, configs_init: dict, 
                 if verbosity >= 2:
                     logger.error(traceback.format_exc())
             
+            timing_breakdown['total_s'] = time.time() - total_start
             return {
                 'success': False,
                 'process_names': None,
@@ -802,7 +847,8 @@ def track_cuts_and_stats(obsid: str, wafer: str, band: str, configs_init: dict, 
                 't2p_stats': {},
                 'aggregate_data': None,
                 'failure_step': failure_step,
-                'error_message': error_msg
+                'error_message': error_msg,
+                'timing_breakdown_s': timing_breakdown if profile_timing else None,
             }
                 
     except Exception as e:
@@ -811,6 +857,7 @@ def track_cuts_and_stats(obsid: str, wafer: str, band: str, configs_init: dict, 
         if verbosity >= 2:
             logger.error(traceback.format_exc())
         
+        timing_breakdown['total_s'] = time.time() - total_start
         return {
             'success': False,
             'process_names': None,
@@ -820,11 +867,13 @@ def track_cuts_and_stats(obsid: str, wafer: str, band: str, configs_init: dict, 
             't2p_stats': {},
             'aggregate_data': None,
             'failure_step': 'unknown',
-            'error_message': error_msg
+            'error_message': error_msg,
+            'timing_breakdown_s': timing_breakdown if profile_timing else None,
         }
 
 def save_results_to_db(db_path: str, obs_id: str, wafer: str, band: str, results: dict,
-                       process_names: List[str], flag_labels: List[str], commit=True):
+                       process_names: List[str], flag_labels: List[str], commit=True,
+                       obsdb: Optional[ObsDb] = None):
     """Save results to the SQLite database.
 
     Parameters
@@ -848,7 +897,10 @@ def save_results_to_db(db_path: str, obs_id: str, wafer: str, band: str, results
         For batched operations on distributed filesystems, pass False
         and manage commits externally to reduce I/O overhead.
     """
-    obsdb = ObsDb(map_file=db_path, init_db=False)
+    local_obsdb = None
+    if obsdb is None:
+        local_obsdb = ObsDb(map_file=db_path, init_db=False)
+        obsdb = local_obsdb
 
     data = {
         'success': int(results['success']),
@@ -907,6 +959,9 @@ def save_results_to_db(db_path: str, obs_id: str, wafer: str, band: str, results
 
     obsdb.update_obs(obs_id, data=data, wafer_info={'wafer': wafer, 'band': band}, commit=commit)
 
+    if local_obsdb is not None:
+        local_obsdb.conn.close()
+
 def main():
     """CLI entry point."""
     parser = argparse.ArgumentParser(description='Track cuts and statistics during SO preprocessing')
@@ -936,7 +991,8 @@ def main():
     base_flag_labels = [label.split('.')[0] for label in full_flag_labels]
     
     # Create tables
-    create_cuts_stats_tables(args.db_path, process_names, base_flag_labels)
+    obsdb = create_cuts_stats_tables(args.db_path, process_names, base_flag_labels)
+    obsdb.conn.close()
     
     # Track cuts and statistics
     results = track_cuts_and_stats(args.obs_id, args.wafer, args.band, configs_init, configs_proc,

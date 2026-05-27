@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Parallel version of track_cuts_and_stats.py for MPI execution on SLURM.
+Parallel version of track_cuts_and_stats.py using sotodlib get_exec_env.
 Tracks detector cuts, sample cuts, and noise statistics during SO preprocessing pipeline.
 """
 
@@ -13,12 +13,12 @@ import numpy as np
 import h5py
 import argparse
 import traceback
-from sotodlib.utils.procs_pool import get_exec_env
 from sotodlib import core
 from sotodlib.core.metadata.obsdb import ObsDb
 import sotodlib.site_pipeline.util as sp_util
 from sotodlib.preprocess import preprocess_util as pp_util
 from sotodlib.preprocess import Pipeline
+from sotodlib.utils.procs_pool import get_exec_env
 
 from track_cuts_and_stats import (
     track_cuts_and_stats,
@@ -31,26 +31,69 @@ from track_cuts_and_stats import (
 
 logger = sp_util.init_logger("track_cuts_stats_parallel")
 
-def main():
-    parser = argparse.ArgumentParser(description='Track cuts and statistics in parallel via MPI')
-    parser.add_argument('--init-config', required=True, help='Init pipeline config file')
-    parser.add_argument('--proc-config', required=True, help='Proc pipeline config file') 
-    parser.add_argument('--db-path', required=True, help='SQLite database path')
-    parser.add_argument('--query', help='Query to pass to observation list')
-    parser.add_argument('--obs-list', help='Text file with list of observation IDs')
-    parser.add_argument('--obs-id', help='Single obs-id to process')
-    parser.add_argument('--min-ctime', help='Minimum timestamp for observation list')
-    parser.add_argument('--max-ctime', help='Maximum timestamp for observation list') 
-    parser.add_argument('--update-delay', type=int, help='Days in past to start observation list')
-    parser.add_argument('--tags', nargs='*', help='Observation tags')
-    parser.add_argument('--verbosity', type=int, default=1, help='Verbosity level (0-3)')
-    parser.add_argument('--batch-size', type=int, default=100, help='Batch size for database commits (set to 0 to commit at end only)')
-    parser.add_argument('--overwrite', action='store_true', help='Overwrite existing entries')
-    parser.add_argument('--aggregate-noise', choices=['T', 'Q', 'U'], help='Aggregate white noise data for polarization')
-    parser.add_argument('--aggregate-output', help='Base path for aggregated HDF5 output (e.g., /path/to/noise)')
+def process_work_item(obs_id, wafer, band, configs_init, configs_proc, 
+                      process_names, full_flag_labels, verbosity, aggregate_noise):
+    """Worker function to process a single work item.
     
-    args = parser.parse_args()
+    Parameters
+    ----------
+    obs_id : str
+        Observation ID
+    wafer : str
+        Wafer slot
+    band : str
+        Band name
+    configs_init : dict
+        Init pipeline config
+    configs_proc : dict
+        Proc pipeline config
+    process_names : list
+        Process names list
+    full_flag_labels : list
+        Flag labels list
+    verbosity : int
+        Verbosity level
+    aggregate_noise : str or None
+        Polarization to aggregate
     
+    Returns
+    -------
+    dict
+        Result dictionary with keys: obs_id, wafer, band, results, aggregate_data
+    """
+    start_wall = time.time()
+    try:
+        results = track_cuts_and_stats(obs_id, wafer, band, configs_init, configs_proc,
+                                      process_names, full_flag_labels, verbosity,
+                                      aggregate_noise=aggregate_noise)
+        worker_walltime_s = time.time() - start_wall
+        return {
+            'obs_id': obs_id,
+            'wafer': wafer,
+            'band': band,
+            'results': results,
+            'aggregate_data': results.get('aggregate_data'),
+            'worker_walltime_s': worker_walltime_s,
+        }
+    except Exception as e:
+        worker_walltime_s = time.time() - start_wall
+        logger.error(f"Exception processing {obs_id} {wafer} {band}: {e}")
+        if verbosity >= 2:
+            logger.error(traceback.format_exc())
+        return {
+            'obs_id': obs_id,
+            'wafer': wafer,
+            'band': band,
+            'results': {
+                'success': False,
+                'error_message': str(e),
+                'aggregate_data': None,
+            },
+            'aggregate_data': None,
+            'worker_walltime_s': worker_walltime_s,
+        }
+
+def _main(executor, as_completed_callable, args):
     # Load configs
     with open(args.init_config, 'r') as f:
         configs_init = yaml.safe_load(f)
@@ -133,34 +176,20 @@ def main():
     
     # Filter existing observations if not overwriting
     if not args.overwrite and os.path.exists(args.db_path):
+        filter_obsdb = None
         try:
-            obsdb = ObsDb(map_file=args.db_path, init_db=False)
-            existing_obsids = set([row['obs_id'] for row in obsdb.query()])
+            filter_obsdb = ObsDb(map_file=args.db_path, init_db=False)
+            existing_obsids = set([row['obs_id'] for row in filter_obsdb.query()])
             obs_list = [obs for obs in obs_list if obs['obs_id'] not in existing_obsids]
             logger.info(f'Filtered to {len(obs_list)} new observations')
         except Exception as e:
             logger.warning(f"Could not filter existing observations: {e}")
+        finally:
+            if filter_obsdb is not None:
+                filter_obsdb.conn.close()
     
-    # Create tables (only on rank 0)
-    try:
-        exec_env = get_exec_env()
-        if hasattr(exec_env, 'comm'):
-            comm = exec_env.comm
-            rank = comm.rank if comm else 0
-            size = comm.size if comm else 1
-        else:
-            # get_exec_env returns (comm, rank, size) tuple in some versions
-            comm, rank, size = exec_env if isinstance(exec_env, tuple) else (None, 0, 1)
-    except Exception as e:
-        logger.warning(f"Could not get MPI environment: {e}")
-        comm, rank, size = None, 0, 1
-    
-    if rank == 0:
-        create_cuts_stats_tables(args.db_path, process_names, base_flag_labels)
-    
-    # Wait for table creation
-    if comm:
-        comm.barrier()
+    # Create tables and get database connection for reuse
+    obsdb = create_cuts_stats_tables(args.db_path, process_names, base_flag_labels)
     
     # Create work list - each item is (obs_id, wafer, band)
     work_items = []
@@ -184,47 +213,47 @@ def main():
                 'current_idx': 0,
             }
     
-    # Process work items in parallel
+    # Process work items in parallel using executor from get_exec_env
     n_processed = 0
     n_failed = 0
     
-    # Use batch processing for database operations to reduce I/O overhead on distributed filesystems
-    batch_size = args.batch_size
-    update_count = 0
-    obsdb = None
-    
-    # Calculate which work items this rank will process
-    my_work_items = [work_items[i] for i in range(rank, len(work_items), size)]
-    
     try:
-        # Open database connection once for all work items in this rank
-        if len(my_work_items) > 0:
-            obsdb = ObsDb(map_file=args.db_path, init_db=False)
+        # Submit all work items
+        futures = {}
+        for obs_id, wafer, band in work_items:
+            future = executor.submit(process_work_item, obs_id, wafer, band, 
+                                    configs_init, configs_proc, process_names, 
+                                    full_flag_labels, args.verbosity, args.aggregate_noise)
+            futures[future] = (obs_id, wafer, band)
         
-        for item_idx, (obs_id, wafer, band) in enumerate(my_work_items):
+        # Use batch processing for database operations
+        batch_size = args.batch_size
+        update_count = 0
+        
+        # Process results as they complete
+        for future in as_completed_callable(futures):
+            obs_id, wafer, band = futures[future]
+            
             try:
-                if args.verbosity >= 2:
-                    logger.info(f"Rank {rank} processing {item_idx+1}/{len(my_work_items)}: {obs_id} {wafer} {band}")
-                
-                # Track cuts and statistics for this observation
-                results = track_cuts_and_stats(obs_id, wafer, band, configs_init, configs_proc,
-                                               process_names, full_flag_labels, args.verbosity,
-                                               aggregate_noise=args.aggregate_noise)
+                result = future.result()
+                results = result['results']
+                worker_walltime_s = result.get('worker_walltime_s')
                 
                 # Save results to database without committing (for batched operations)
                 save_results_to_db(args.db_path, obs_id, wafer, band, results,
-                                   process_names, base_flag_labels, commit=False)
+                                   process_names, base_flag_labels, commit=False,
+                                   obsdb=obsdb)
                 update_count += 1
                 
                 # Commit periodically to reduce I/O overhead on distributed filesystems
                 if batch_size > 0 and update_count % batch_size == 0:
                     if args.verbosity >= 2:
-                        logger.info(f"Rank {rank}: Committing batch of {batch_size} database updates")
+                        logger.info(f"Committing batch of {batch_size} database updates")
                     obsdb.conn.commit()
                 
                 # Collect aggregation data if requested and available
-                if args.aggregate_noise and results.get('aggregate_data') is not None:
-                    agg = results['aggregate_data']
+                if args.aggregate_noise and result.get('aggregate_data') is not None:
+                    agg = result['aggregate_data']
                     band_agg = aggregate_data[band]
                     
                     # Track range for this observation
@@ -237,121 +266,95 @@ def main():
                     band_agg['wafer_slots'].append(agg['wafer_slots'])
                     band_agg['current_idx'] += n_dets
                 
-                if results['success']:
+                if results.get('success', True):
                     n_processed += 1
                     if args.verbosity >= 1:
-                        logger.info(f"Rank {rank}: Processed {obs_id} {wafer} {band}")
+                        if worker_walltime_s is not None:
+                            logger.info(f"Processed {obs_id} {wafer} {band} worker={worker_walltime_s:.3f}s")
+                        else:
+                            logger.info(f"Processed {obs_id} {wafer} {band}")
                 else:
                     n_failed += 1
-                    logger.warning(f"Rank {rank}: Failed {obs_id} {wafer} {band}: {results['error_message']}")
+                    error_msg = results.get('error_message', 'Unknown error')
+                    if worker_walltime_s is not None:
+                        logger.warning(f"Failed {obs_id} {wafer} {band} worker={worker_walltime_s:.3f}s: {error_msg}")
+                    else:
+                        logger.warning(f"Failed {obs_id} {wafer} {band}: {error_msg}")
                     
             except Exception as e:
                 n_failed += 1
-                logger.error(f"Rank {rank}: Exception processing {obs_id} {wafer} {band}: {e}")
+                logger.error(f"Exception processing {obs_id} {wafer} {band}: {e}")
                 if args.verbosity >= 2:
                     logger.error(traceback.format_exc())
-    
-    finally:
+        
         # Final commit for any remaining database updates
         if obsdb is not None and update_count > 0:
-            # Only commit if we haven't already committed the last batch
             remaining = update_count % batch_size if batch_size > 0 else update_count
             if remaining > 0:
                 if args.verbosity >= 2:
-                    logger.info(f"Rank {rank}: Final commit of {remaining} database updates")
+                    logger.info(f"Final commit of {remaining} database updates")
                 obsdb.conn.commit()
         
+        # Log final statistics
+        total_processed = n_processed
+        total_failed = n_failed
+        logger.info(f"Final results: {total_processed} processed, {total_failed} failed")
+        
+    finally:
         # Close the database connection
         if obsdb is not None:
             obsdb.conn.close()
+
+        # Shutdown process pool if using process-based executor
+        if hasattr(executor, 'shutdown'):
+            executor.shutdown(wait=True)
     
-    # Gather statistics and aggregation data
-    if comm:
-        all_processed = comm.gather(n_processed, root=0)
-        all_failed = comm.gather(n_failed, root=0)
-        
-        if rank == 0:
-            total_processed = sum(all_processed)
-            total_failed = sum(all_failed)
-            logger.info(f"Final results: {total_processed} processed, {total_failed} failed")
-    else:
-        logger.info(f"Single process results: {n_processed} processed, {n_failed} failed")
-    
-    # Gather and write aggregated data (rank 0 only)
+    # Write aggregated data if requested
     if args.aggregate_noise and args.aggregate_output:
-        if comm:
-            # Gather aggregate_data from all ranks to rank 0
-            all_agg_data = comm.gather(aggregate_data, root=0)
-            
-            if rank == 0:
-                # Combine data from all ranks
-                combined_agg = {band: {} for band in bands}
-                for band in bands:
-                    combined_agg[band] = {
-                        'white_noise': [],
-                        'det_ids': [],
-                        'wafer_slots': [],
-                        'obs_ranges': {},
-                        'current_idx': 0,
-                    }
+        for band in bands:
+            band_agg = aggregate_data[band]
+            if band_agg['white_noise']:
+                # Combine arrays
+                band_data = {
+                    'white_noise': np.concatenate(band_agg['white_noise']),
+                    'det_ids': np.concatenate(band_agg['det_ids']),
+                    'wafer_slots': np.concatenate(band_agg['wafer_slots']),
+                    'obs_ranges': band_agg['obs_ranges'],
+                    'obs_ids': list(band_agg['obs_ranges'].keys()),
+                }
                 
-                for rank_data in all_agg_data:
-                    if rank_data is None:
-                        continue
-                    for band in bands:
-                        if rank_data[band]['white_noise']:
-                            band_agg = combined_agg[band]
-                            n_existing = band_agg['current_idx']
-                            
-                            # Update obs_ranges to account for offset
-                            for obs_id, (start, end) in rank_data[band]['obs_ranges'].items():
-                                band_agg['obs_ranges'][obs_id] = (start + n_existing, end + n_existing)
-                            
-                            # Append arrays
-                            band_agg['white_noise'].extend(rank_data[band]['white_noise'])
-                            band_agg['det_ids'].extend(rank_data[band]['det_ids'])
-                            band_agg['wafer_slots'].extend(rank_data[band]['wafer_slots'])
-                            band_agg['current_idx'] += sum(len(arr) for arr in rank_data[band]['white_noise'])
-                
-                # Write combined data
-                for band in bands:
-                    band_agg = combined_agg[band]
-                    if band_agg['white_noise']:
-                        # Combine arrays
-                        band_data = {
-                            'white_noise': np.concatenate(band_agg['white_noise']),
-                            'det_ids': np.concatenate(band_agg['det_ids']),
-                            'wafer_slots': np.concatenate(band_agg['wafer_slots']),
-                            'obs_ranges': band_agg['obs_ranges'],
-                            'obs_ids': list(band_agg['obs_ranges'].keys()),
-                        }
-                        
-                        # Write to HDF5
-                        output_file = f"{args.aggregate_output}_{band}.h5"
-                        logger.info(f"Rank 0: Writing {len(band_data['det_ids'])} detectors to {output_file}")
-                        write_band_noise_to_hdf5(band_data, band, output_file)
-                    else:
-                        logger.info(f"Rank 0: No aggregation data for {band}")
-        else:
-            # Single process: write aggregation data directly
-            for band in bands:
-                band_agg = aggregate_data[band]
-                if band_agg['white_noise']:
-                    # Combine arrays
-                    band_data = {
-                        'white_noise': np.concatenate(band_agg['white_noise']),
-                        'det_ids': np.concatenate(band_agg['det_ids']),
-                        'wafer_slots': np.concatenate(band_agg['wafer_slots']),
-                        'obs_ranges': band_agg['obs_ranges'],
-                        'obs_ids': list(band_agg['obs_ranges'].keys()),
-                    }
-                    
-                    # Write to HDF5
-                    output_file = f"{args.aggregate_output}_{band}.h5"
-                    logger.info(f"Writing {len(band_data['det_ids'])} detectors to {output_file}")
-                    write_band_noise_to_hdf5(band_data, band, output_file)
-                else:
-                    logger.info(f"No aggregation data for {band}")
+                # Write to HDF5
+                output_file = f"{args.aggregate_output}_{band}.h5"
+                logger.info(f"Writing {len(band_data['det_ids'])} detectors to {output_file}")
+                write_band_noise_to_hdf5(band_data, band, output_file)
+            else:
+                logger.info(f"No aggregation data for {band}")
+
+
+def main():
+    parser = argparse.ArgumentParser(description='Track cuts and statistics in parallel via sotodlib get_exec_env')
+    parser.add_argument('--init-config', required=True, help='Init pipeline config file')
+    parser.add_argument('--proc-config', required=True, help='Proc pipeline config file') 
+    parser.add_argument('--db-path', required=True, help='SQLite database path')
+    parser.add_argument('--query', help='Query to pass to observation list')
+    parser.add_argument('--obs-list', help='Text file with list of observation IDs')
+    parser.add_argument('--obs-id', help='Single obs-id to process')
+    parser.add_argument('--min-ctime', help='Minimum timestamp for observation list')
+    parser.add_argument('--max-ctime', help='Maximum timestamp for observation list') 
+    parser.add_argument('--update-delay', type=int, help='Days in past to start observation list')
+    parser.add_argument('--tags', nargs='*', help='Observation tags')
+    parser.add_argument('--verbosity', type=int, default=1, help='Verbosity level (0-3)')
+    parser.add_argument('--batch-size', type=int, default=100, help='Batch size for database commits (set to 0 to commit at end only)')
+    parser.add_argument('--nprocs', type=int, help='Number of processes for process-pool mode (MPI mode uses communicator size)')
+    parser.add_argument('--overwrite', action='store_true', help='Overwrite existing entries')
+    parser.add_argument('--aggregate-noise', choices=['T', 'Q', 'U'], help='Aggregate white noise data for polarization')
+    parser.add_argument('--aggregate-output', help='Base path for aggregated HDF5 output (e.g., /path/to/noise)')
+
+    args = parser.parse_args()
+
+    rank, executor, as_completed_callable = get_exec_env(args.nprocs)
+    if rank == 0:
+        _main(executor=executor, as_completed_callable=as_completed_callable, args=args)
 
 if __name__ == "__main__":
     main()
