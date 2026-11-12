@@ -15,7 +15,8 @@ import argparse
 import traceback
 from sotodlib import core
 from sotodlib.core.metadata.obsdb import ObsDb
-import sotodlib.site_pipeline.util as sp_util
+from sotodlib.site_pipeline.utils.logging import init_logger
+from sotodlib.site_pipeline.utils.obsdb import get_obslist
 from sotodlib.preprocess import preprocess_util as pp_util
 from sotodlib.preprocess import Pipeline
 from sotodlib.utils.procs_pool import get_exec_env
@@ -29,7 +30,7 @@ from track_cuts_and_stats import (
     write_band_noise_to_hdf5,
 )
 
-logger = sp_util.init_logger("track_cuts_stats_parallel")
+logger = init_logger("track_cuts_stats_parallel")
 
 def process_work_item(obs_id, wafer, band, configs_init, configs_proc, 
                       process_names, full_flag_labels, verbosity, aggregate_noise):
@@ -117,7 +118,7 @@ def _main(executor, as_completed_callable, args):
         logger.info(f'Loaded {len(obs_list)} observations from {args.obs_list}')
     else:
         # Use database query
-        obs_list = sp_util.get_obslist(context, query=args.query, obs_id=args.obs_id, 
+        obs_list = get_obslist(context, query=args.query, obs_id=args.obs_id, 
                                        min_ctime=args.min_ctime, max_ctime=args.max_ctime,
                                        update_delay=args.update_delay, tags=args.tags)
     
@@ -133,7 +134,7 @@ def _main(executor, as_completed_callable, args):
     tube_flavor_to_bands = {
         'lf': ['f030', 'f040'],
         'mf': ['f090', 'f150'],
-        'uf': ['f220', 'f280'],
+        'uhf': ['f220', 'f280'],
     }
     try:
         if context.obsdb and obs_list:
@@ -256,9 +257,17 @@ def _main(executor, as_completed_callable, args):
                     agg = result['aggregate_data']
                     band_agg = aggregate_data[band]
                     
-                    # Track range for this observation
+                    # Track the range for this GROUP, not this observation.
+                    # Work items are (obs_id, wafer, band), so keying on
+                    # obs_id alone made each wafer overwrite the previous
+                    # wafer's range: the arrays below still received every
+                    # wafer, but the index could only find the last one
+                    # written, leaving ~80% of the aggregated detectors
+                    # unreachable and making every per-observation statistic
+                    # a single-wafer sample.
                     n_dets = len(agg['det_ids'])
-                    band_agg['obs_ranges'][obs_id] = (band_agg['current_idx'], band_agg['current_idx'] + n_dets)
+                    band_agg['obs_ranges'][(obs_id, wafer)] = (
+                        band_agg['current_idx'], band_agg['current_idx'] + n_dets)
                     
                     # Append data
                     band_agg['white_noise'].append(agg['white_noise'])
@@ -319,8 +328,10 @@ def _main(executor, as_completed_callable, args):
                     'white_noise': np.concatenate(band_agg['white_noise']),
                     'det_ids': np.concatenate(band_agg['det_ids']),
                     'wafer_slots': np.concatenate(band_agg['wafer_slots']),
+                    # Keys are (obs_id, wafer); the writer emits one entry per
+                    # group, so obs_ids repeats once per wafer.
                     'obs_ranges': band_agg['obs_ranges'],
-                    'obs_ids': list(band_agg['obs_ranges'].keys()),
+                    'group_keys': list(band_agg['obs_ranges'].keys()),
                 }
                 
                 # Write to HDF5

@@ -5,6 +5,7 @@ This script runs the pipeline step-by-step to track actual detector selection li
 """
 
 import os
+import re
 import yaml
 import time
 import logging
@@ -20,12 +21,39 @@ from sotodlib.core import AxisManager
 from so3g.proj import RangesMatrix, Ranges
 from sotodlib.core.flagman import count_cuts, has_any_cuts
 from sotodlib.core.metadata.obsdb import ObsDb
-import sotodlib.site_pipeline.util as sp_util
+from sotodlib.site_pipeline.utils.logging import init_logger
 from sotodlib.preprocess import preprocess_util as pp_util
 from sotodlib.preprocess import _Preprocess, Pipeline, processes, pcore
 import h5py
 
-logger = sp_util.init_logger("track_cuts_and_stats")
+logger = init_logger("track_cuts_and_stats")
+
+def _array_noise(white_noise):
+    """Inverse-variance combined array noise, ignoring non-measurements.
+
+    The previous form was
+
+        1/np.sqrt(np.nansum(1/np.array(white_noise)**2))
+
+    which nansum protects against NaN but not against zeros: a single
+    detector with white_noise == 0 makes 1/0**2 infinite, the sum infinite,
+    and the result exactly 0.0. Those zeros are common -- 2.0M of 31.7M
+    satp3 f090 detectors and 3.8M of 33.3M at f150 -- so 43% of satp3's
+    array_noise values were written as 0.0 and silently dragged every
+    downstream median down. satp2 has none, which is why it never showed
+    there.
+
+    Only finite, strictly positive values are a measurement, so the sum runs
+    over those and n_array_noise counts them. A group with nothing usable
+    yields NaN rather than 0.0, so it reads as missing instead of perfect.
+    """
+    wn = np.asarray(white_noise, dtype=float)
+    good = np.isfinite(wn) & (wn > 0)
+    if not good.any():
+        return {'array_noise': np.nan, 'n_array_noise': 0}
+    return {'array_noise': 1/np.sqrt(np.sum(1/wn[good]**2)),
+            'n_array_noise': int(good.sum())}
+
 
 def get_quantiles(data, quantiles=[0.1, 0.25, 0.5, 0.75, 0.9]):
     """Compute quantiles of data while ignoring NaNs.
@@ -500,8 +528,7 @@ def extract_statistics(aman_init, aman_proc, pipe_init, pipe_proc, return_aggreg
             'white_noise_q50': wn_quantiles[2],
             'white_noise_q75': wn_quantiles[3],
             'white_noise_q90': wn_quantiles[4],
-            'array_noise': 1/np.sqrt(np.nansum(1/np.array(white_noise)**2)),
-            'n_array_noise': len(white_noise),
+            **_array_noise(white_noise),
         })
 
         # Extract fit parameters if available
@@ -623,20 +650,29 @@ def write_band_noise_to_hdf5(band_data, band, output_path):
         
         f.create_dataset('wafer_slots', data=band_data['wafer_slots'], compression='gzip')
         
-        # Store obs_ranges as separate start/end arrays with obs_id index
-        obs_ids = band_data['obs_ids']
-        obs_starts = np.array([band_data['obs_ranges'][oid][0] for oid in obs_ids], dtype=np.int64)
-        obs_ends = np.array([band_data['obs_ranges'][oid][1] for oid in obs_ids], dtype=np.int64)
-        
+        # One index entry per (obs_id, wafer) group, so obs_ids repeats once
+        # per wafer and every detector in the arrays above is reachable.
+        # Older files carried one entry per obs_id and therefore indexed only
+        # the last wafer written for each observation; 'entry_unit' marks
+        # which convention a file follows.
+        group_keys = band_data['group_keys']
+        obs_ids = [k[0] for k in group_keys]
+        wafers = [k[1] for k in group_keys]
+        obs_starts = np.array([band_data['obs_ranges'][k][0] for k in group_keys], dtype=np.int64)
+        obs_ends = np.array([band_data['obs_ranges'][k][1] for k in group_keys], dtype=np.int64)
+
         # Use variable-length UTF-8 strings for observation IDs
         f.create_dataset('obs_ids', data=np.asarray(obs_ids, dtype=object), dtype=dt)
+        f.create_dataset('obs_wafers', data=np.asarray(wafers, dtype=object), dtype=dt)
         f.create_dataset('obs_starts', data=obs_starts)
         f.create_dataset('obs_ends', data=obs_ends)
-        
+
         # Add metadata
         f.attrs['band'] = band
         f.attrs['n_total_dets'] = len(band_data['det_ids'])
-        f.attrs['n_obs'] = len(obs_ids)
+        f.attrs['n_entries'] = len(group_keys)
+        f.attrs['n_obs'] = len(set(obs_ids))
+        f.attrs['entry_unit'] = 'obs_wafer'
 
 def track_cuts_and_stats(obsid: str, wafer: str, band: str, configs_init: dict, configs_proc: dict,
                         process_names: Optional[List[str]] = None, flag_labels: Optional[List[str]] = None,
@@ -691,7 +727,14 @@ def track_cuts_and_stats(obsid: str, wafer: str, band: str, configs_init: dict, 
     
     if verbosity >= 1:
         logger.info(f"Processing {obsid} {wafer} {band}")
-    
+
+    # Bound before the outer try so a failure anywhere below can still report
+    # the detector counts measured up to that point. The first entry is the
+    # loaded count from get_meta, which is the denominator of every
+    # detector-hour fraction and is not recoverable from anywhere else once a
+    # group dies -- see the failure returns below.
+    det_counts = []
+
     try:
         # Initialize contexts
         t0 = time.time()
@@ -700,7 +743,6 @@ def track_cuts_and_stats(obsid: str, wafer: str, band: str, configs_init: dict, 
         timing_breakdown['setup_context_s'] = time.time() - t0
         
         dets = {'wafer_slot': wafer, 'wafer.bandpass': band}
-        det_counts = []
         first_time = (process_names is None)
         
         if first_time:
@@ -749,6 +791,11 @@ def track_cuts_and_stats(obsid: str, wafer: str, band: str, configs_init: dict, 
             # Run proc pipeline if configured
             aman_proc_final = None
             meta_proc = None
+            # Bind pipe_proc up front: if ctx_proc.get_meta() below raises, the
+            # except branch only rebuilds it when first_time is True, and the
+            # later `pipe_proc if cfg_proc else None` would hit an unbound local
+            # and fail the whole group instead of falling back to init-only stats.
+            pipe_proc = None
             if cfg_proc:
                 try:
                     t0 = time.time()
@@ -838,10 +885,18 @@ def track_cuts_and_stats(obsid: str, wafer: str, band: str, configs_init: dict, 
                     logger.error(traceback.format_exc())
             
             timing_breakdown['total_s'] = time.time() - total_start
+            # Keep the detector counts measured before the failure rather than
+            # discarding them. For a group the pipeline destroyed -- every
+            # group killed by noisy_subscan_flags, for instance --
+            # det_0_starting_ndets is the only record of how many detectors
+            # were ever loaded, and save_results_to_db already fills the
+            # columns past the failure with NULL. Rows that fail still carry
+            # total_samples = 0, so every plot that selects on
+            # 'total_samples > 0' is unaffected.
             return {
                 'success': False,
                 'process_names': None,
-                'det_counts': [],
+                'det_counts': det_counts,
                 'sample_cuts': {},
                 'noise_stats': {},
                 't2p_stats': {},
@@ -861,7 +916,7 @@ def track_cuts_and_stats(obsid: str, wafer: str, band: str, configs_init: dict, 
         return {
             'success': False,
             'process_names': None,
-            'det_counts': [],
+            'det_counts': det_counts,
             'sample_cuts': {},
             'noise_stats': {},
             't2p_stats': {},
@@ -902,7 +957,12 @@ def save_results_to_db(db_path: str, obs_id: str, wafer: str, band: str, results
         local_obsdb = ObsDb(map_file=db_path, init_db=False)
         obsdb = local_obsdb
 
+    # ObsDb's base schema supplies the timestamp column but never fills it; the
+    # ctime is carried in obs_id as <obs|oper>_<ctime>_<telescope>_<wafers>.
+    ctime_match = re.match(r'[A-Za-z]+_(\d+)_', obs_id)
+
     data = {
+        'timestamp': float(ctime_match.group(1)) if ctime_match else None,
         'success': int(results['success']),
         'failure_step': results.get('failure_step'),
         'error_message': results.get('error_message'),
@@ -956,6 +1016,18 @@ def save_results_to_db(db_path: str, obs_id: str, wafer: str, band: str, results
         'redchi2sU_avg',
     ]:
         data[f"t2p_{metric}"] = t2p_stats.get(metric)
+
+    # Normalize numpy scalar types to native Python types before handing off to
+    # sqlite3. numpy.float32 isn't a `float` subclass (unlike numpy.float64) and
+    # isn't recognized by sqlite3's parameter binding, which silently falls back
+    # to storing its raw 4-byte memory as a BLOB (via the buffer protocol)
+    # instead of a REAL column value -- this affects fields like array_noise and
+    # white_noise_avg, which are computed from float32 white_noise arrays.
+    for key, value in data.items():
+        if isinstance(value, np.floating):
+            data[key] = float(value)
+        elif isinstance(value, np.integer):
+            data[key] = int(value)
 
     obsdb.update_obs(obs_id, data=data, wafer_info={'wafer': wafer, 'band': band}, commit=commit)
 

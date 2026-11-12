@@ -13,18 +13,30 @@
 # Run iso-v4 processing for SATPv1 using sotodlib get_exec_env (MPI/process-pool)
 # Full observatory preprocessing for all SATp1 observations with batched database commits
 
+# Force the soconda env's python3 (with sotodlib/yaml/etc.) first on PATH.
+# Needed because --export=ALL forwards whatever PATH the submitting shell had,
+# which can be polluted by an unrelated project virtualenv shadowing python3.
+export PATH="/scratch/gpfs/SIMONSOBS/env/v0.6.18/soconda_v0.6.18/bin:${PATH}"
+
+# Use the working copy of sotodlib at ~/repos/sotodlib -- the same one the real
+# preprocessing runs from -- rather than the copy installed in the soconda env.
+# The env copy is older: its preprocess AzSS.select() references a nonexistent
+# self.azss_stats_name, so every proc-stage pipeline raises AttributeError and
+# no noise statistics are collected.
+export PYTHONPATH="/home/ms3067/repos/sotodlib${PYTHONPATH:+:${PYTHONPATH}}"
+
 # Set OpenMP threads to match cpus-per-task to prevent oversubscription
 export OMP_NUM_THREADS=1
 
 # Configuration
-BASE_DIR="${HOME}/repos/iso-sat/v4"
+BASE_DIR="${HOME}/repos/iso-sat/v4_paper"
 SCRIPT_PATH="/home/ms3067/so_data_exploration/tiger/202601_v4/track_cuts_and_stats_parallel.py"
 SAT_TAG="satp1"
 
 # Config and observation list paths
-INIT_CONFIG="${BASE_DIR}/preprocessing/satp1/preprocessing_config_20260417_init.yaml"
-PROC_CONFIG="${BASE_DIR}/preprocessing/satp1/preprocessing_config_20260417_proc.yaml"
-OBS_LIST="${BASE_DIR}/preprocessing/satp1/listv4.txt"
+INIT_CONFIG="${BASE_DIR}/preprocessing/satp1/preprocessing_config_20260802_init.yaml"
+PROC_CONFIG="${BASE_DIR}/preprocessing/satp1/preprocessing_config_20260802_proc.yaml"
+OBS_LIST="${BASE_DIR}/preprocessing/satp1/listv4_paper.txt"
 
 # Derive version number from proc config name, e.g. preprocessing_config_20260417_proc.yaml -> satp1_20260417
 PROC_BASENAME="$(basename "${PROC_CONFIG}")"
@@ -79,7 +91,7 @@ ${LAUNCH_STR} python3 "${SCRIPT_PATH}" \
     --aggregate-output "${AGG_DIR}/noise_aggregation" \
     2>&1 | tee "${LOG_DIR}/processing_${SLURM_JOB_ID}.log"
 
-PROCESS_STATUS=$?
+PROCESS_STATUS=${PIPESTATUS[0]}
 
 if [ $PROCESS_STATUS -ne 0 ]; then
     echo "[$(date)] Main processing failed with status $PROCESS_STATUS"

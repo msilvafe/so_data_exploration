@@ -213,8 +213,9 @@ def step_cut_fracs(step_values: np.ndarray, denom: float) -> np.ndarray:
 
 
 def compute_hours_stats(td: TelescopeData) -> dict[str, float]:
-    det_hours_by_band = {'f090': 0.0, 'f150': 0.0}
-    obs_hours_by_band = {'f090': 0.0, 'f150': 0.0}
+    bands = td.bands
+    det_hours_by_band = {b: 0.0 for b in bands}
+    obs_hours_by_band = {b: 0.0 for b in bands}
 
     for (_ts, band), info in td.obs_band_agg.items():
         final_ndets = float(info['step_sums'][-1])
@@ -229,23 +230,19 @@ def compute_hours_stats(td: TelescopeData) -> dict[str, float]:
     if len(tss) >= 2:
         cal_hours = (tss[-1] - tss[0]) / 3600.0
 
-    out = {
-        'det_hours_f090': det_hours_by_band.get('f090', 0.0),
-        'det_hours_f150': det_hours_by_band.get('f150', 0.0),
-        'det_hours_combined': det_hours_by_band.get('f090', 0.0) + det_hours_by_band.get('f150', 0.0),
-        'possible_det_hours_f090': cal_hours * MAX_DETECTORS_PER_BAND,
-        'possible_det_hours_f150': cal_hours * MAX_DETECTORS_PER_BAND,
-        'possible_det_hours_combined': cal_hours * MAX_DETECTORS_TOTAL,
-        'calendar_hours': cal_hours,
-        'obs_hours_f090': obs_hours_by_band.get('f090', 0.0),
-        'obs_hours_f150': obs_hours_by_band.get('f150', 0.0),
-        'obs_hours_combined': obs_hours_by_band.get('f090', 0.0) + obs_hours_by_band.get('f150', 0.0),
-    }
-    out['det_frac_f090'] = out['det_hours_f090'] / out['possible_det_hours_f090'] if out['possible_det_hours_f090'] > 0 else np.nan
-    out['det_frac_f150'] = out['det_hours_f150'] / out['possible_det_hours_f150'] if out['possible_det_hours_f150'] > 0 else np.nan
+    out: dict[str, float] = {'_bands': bands, 'calendar_hours': cal_hours}
+    for b in bands:
+        out[f'det_hours_{b}'] = det_hours_by_band.get(b, 0.0)
+        out[f'possible_det_hours_{b}'] = cal_hours * MAX_DETECTORS_PER_BAND
+        out[f'obs_hours_{b}'] = obs_hours_by_band.get(b, 0.0)
+    out['det_hours_combined'] = sum(det_hours_by_band.get(b, 0.0) for b in bands)
+    out['possible_det_hours_combined'] = cal_hours * MAX_DETECTORS_TOTAL
+    out['obs_hours_combined'] = sum(obs_hours_by_band.get(b, 0.0) for b in bands)
+
+    for b in bands:
+        out[f'det_frac_{b}'] = out[f'det_hours_{b}'] / out[f'possible_det_hours_{b}'] if out[f'possible_det_hours_{b}'] > 0 else np.nan
+        out[f'obs_frac_{b}'] = out[f'obs_hours_{b}'] / out['calendar_hours'] if out['calendar_hours'] > 0 else np.nan
     out['det_frac_combined'] = out['det_hours_combined'] / out['possible_det_hours_combined'] if out['possible_det_hours_combined'] > 0 else np.nan
-    out['obs_frac_f090'] = out['obs_hours_f090'] / out['calendar_hours'] if out['calendar_hours'] > 0 else np.nan
-    out['obs_frac_f150'] = out['obs_hours_f150'] / out['calendar_hours'] if out['calendar_hours'] > 0 else np.nan
     out['obs_frac_combined'] = out['obs_hours_combined'] / out['calendar_hours'] if out['calendar_hours'] > 0 else np.nan
     return out
 
@@ -260,13 +257,14 @@ def _stats(vals: list[float]) -> tuple[float, float, float]:
 
 def compute_detector_yield_rows(td: TelescopeData) -> list[tuple[str, str, tuple[float, float, float]]]:
     rows: list[tuple[str, str, tuple[float, float, float]]] = []
+    bands = td.bands
 
     # Total across both bands, summed by timestamp.
     total_vals = [float(v['step_sums'][-1]) / MAX_DETECTORS_TOTAL for _, v in sorted(td.obs_total_agg.items())]
-    rows.append(('All wafers', 'f090+f150', _stats(total_vals)))
+    rows.append(('All wafers', '+'.join(bands), _stats(total_vals)))
 
     # All wafers per band, summed by (timestamp, band).
-    for band in ['f090', 'f150']:
+    for band in bands:
         vals = [
             float(v['step_sums'][-1]) / MAX_DETECTORS_PER_BAND
             for (ts, b), v in sorted(td.obs_band_agg.items())
@@ -276,7 +274,7 @@ def compute_detector_yield_rows(td: TelescopeData) -> list[tuple[str, str, tuple
 
     # Each wafer, split by band.
     for wafer in td.wafer_names:
-        for band in ['f090', 'f150']:
+        for band in bands:
             vals = []
             for r in td.success_rows:
                 if r.get('wafer') == wafer and r.get('band') == band:
@@ -310,11 +308,11 @@ def compute_cut_step_stats(td: TelescopeData) -> tuple[list[str], list[tuple[str
             stats.append((float(np.nanmean(col)), float(np.nanmedian(col))))
         rows.append((label, stats))
 
-    row_stats([step_cut_fracs(v['step_sums'], MAX_DETECTORS_TOTAL) for _, v in sorted(td.obs_total_agg.items())], 'Total f090+f150')
-    for band in ['f090', 'f150']:
+    row_stats([step_cut_fracs(v['step_sums'], MAX_DETECTORS_TOTAL) for _, v in sorted(td.obs_total_agg.items())], f"Total {'+'.join(td.bands)}")
+    for band in td.bands:
         row_stats([step_cut_fracs(v['step_sums'], MAX_DETECTORS_PER_BAND) for (ts, b), v in sorted(td.obs_band_agg.items()) if b == band], f'All wafers {band}')
     for wafer in td.wafer_names:
-        for band in ['f090', 'f150']:
+        for band in td.bands:
             frac_rows = []
             for r in td.success_rows:
                 if r.get('wafer') == wafer and r.get('band') == band:
@@ -335,9 +333,9 @@ def compute_sample_summary_rows(td: TelescopeData) -> list[tuple[str, float, flo
         flagged = 1.0 - keep if p > 0 else np.nan
         rows.append((label, p, f, keep, flagged))
 
-    summarize([v['possible_samples'] for _, v in sorted(td.obs_total_agg.items())], [v['final_samples'] for _, v in sorted(td.obs_total_agg.items())], 'Total f090+f150')
+    summarize([v['possible_samples'] for _, v in sorted(td.obs_total_agg.items())], [v['final_samples'] for _, v in sorted(td.obs_total_agg.items())], f"Total {'+'.join(td.bands)}")
 
-    for band in ['f090', 'f150']:
+    for band in td.bands:
         summarize(
             [v['possible_samples'] for (ts, b), v in sorted(td.obs_band_agg.items()) if b == band],
             [v['final_samples'] for (ts, b), v in sorted(td.obs_band_agg.items()) if b == band],
@@ -345,7 +343,7 @@ def compute_sample_summary_rows(td: TelescopeData) -> list[tuple[str, float, flo
         )
 
     for wafer in td.wafer_names:
-        for band in ['f090', 'f150']:
+        for band in td.bands:
             possible = []
             final = []
             for r in td.success_rows:
@@ -392,7 +390,7 @@ def compute_sample_step_proxy(td: TelescopeData) -> tuple[list[str], list[tuple[
                     fracs.append((sample_flag * det_cuts / dsum))
                 else:
                     fracs.append(np.zeros_like(det_cuts))
-        elif level in ('f090', 'f150'):
+        elif level in td.bands:
             for (ts, band), info in sorted(td.obs_band_agg.items()):
                 if band != level:
                     continue
@@ -446,11 +444,11 @@ def compute_sample_step_proxy(td: TelescopeData) -> tuple[list[str], list[tuple[
             stats.append((float(np.nanmean(col)), float(np.nanmedian(col))))
         out_rows.append((label, stats))
 
-    append_proxy('Total f090+f150', 'total')
-    append_proxy('All wafers f090', 'f090')
-    append_proxy('All wafers f150', 'f150')
+    append_proxy(f"Total {'+'.join(td.bands)}", 'total')
+    for band in td.bands:
+        append_proxy(f'All wafers {band}', band)
     for wafer in td.wafer_names:
-        for band in ['f090', 'f150']:
+        for band in td.bands:
             append_proxy(f'{wafer} {band}', f'{wafer}|{band}')
 
     return step_names, out_rows, td.sample_step_columns_available
@@ -1178,7 +1176,7 @@ def latex_noise_q50_global_table(n1: dict[str, object], n3: dict[str, object]) -
     for pol in NOISE_POLS:
         for metric, _label in NOISE_Q50_METRICS:
             col = f'noise_{pol}_{metric}'
-            lines.append(f"{latex_escape(col)} & {fmt_num(float(g1.get(col, np.nan)))} & {fmt_num(float(g3.get(col, np.nan)))} \\")
+            lines.append(f"{latex_escape(col)} & {fmt_num(float(g1.get(col, np.nan)))} & {fmt_num(float(g3.get(col, np.nan)))} \\\\")
     lines += [r'\bottomrule', r'\end{tabular}', r'\end{table}']
     return '\n'.join(lines)
 
@@ -1202,14 +1200,191 @@ def latex_agg_noise_compare_table(a1: dict[str, object], a3: dict[str, object]) 
     for band in ['f090', 'f150']:
         v1 = float(s2_1.get(band, {}).get('mean_net_array', np.nan))
         v3 = float(s2_3.get(band, {}).get('mean_net_array', np.nan))
-        lines.append(f"2\\_per\\_band & {latex_escape(band)} & {fmt_num(v1)} & {fmt_num(v3)} \\")
+        lines.append(f"2\\_per\\_band & {latex_escape(band)} & {fmt_num(v1)} & {fmt_num(v3)} \\\\")
     lines.append(
-        f"3\\_per\\_band\\_total & all\\_bands & {fmt_num(float(s3_1.get('mean_net_array', np.nan)))} & {fmt_num(float(s3_3.get('mean_net_array', np.nan)))} \\")
+        f"3\\_per\\_band\\_total & all\\_bands & {fmt_num(float(s3_1.get('mean_net_array', np.nan)))} & {fmt_num(float(s3_3.get('mean_net_array', np.nan)))} \\\\")
     lines += [r'\bottomrule', r'\end{tabular}', r'\end{table}']
     return '\n'.join(lines)
 
 
-def gather_plot_paths() -> dict[str, list[str]]:
+# ---- Single-telescope table variants (used by build_report_single) ----
+
+def latex_hours_table_single(telescope: str, stats: dict[str, float]) -> str:
+    bands = stats['_bands']
+    rows = []
+    for b in bands:
+        rows.append((f'Det-hours {b}', f'det_hours_{b}'))
+    rows.append(('Det-hours total', 'det_hours_combined'))
+    for b in bands:
+        rows.append((f'Possible det-hours {b}', f'possible_det_hours_{b}'))
+    rows.append(('Possible det-hours total', 'possible_det_hours_combined'))
+    for b in bands:
+        rows.append((f'Det-hour fraction {b}', f'det_frac_{b}'))
+    rows.append(('Det-hour fraction total', 'det_frac_combined'))
+    rows.append(('Calendar hours', 'calendar_hours'))
+    for b in bands:
+        rows.append((f'Obs hours {b}', f'obs_hours_{b}'))
+    rows.append(('Obs hours total', 'obs_hours_combined'))
+    for b in bands:
+        rows.append((f'Obs/calendar {b}', f'obs_frac_{b}'))
+    rows.append(('Obs/calendar total', 'obs_frac_combined'))
+    lines = [
+        r'\begin{table}[H]',
+        r'\centering',
+        r'\caption{Detector-hours and calendar-hours summary.}',
+        r'\begin{tabular}{lc}',
+        r'\toprule',
+        rf'Metric & {telescope.upper()} \\',
+        r'\midrule',
+    ]
+    for label, key in rows:
+        v = fmt_pct(stats[key]) if 'frac' in key else fmt_num(stats[key])
+        lines.append(f"{latex_escape(label)} & {v} \\\\")
+    lines += [r'\bottomrule', r'\end{tabular}', r'\end{table}']
+    return '\n'.join(lines)
+
+
+def latex_yield_table_single(telescope: str, rows: list[tuple[str, str, tuple[float, float, float]]], wafer_names: list[str], bands: list[str]) -> str:
+    m = {(a, b): c for a, b, c in rows}
+
+    lines = [
+        r'\begin{table}[H]',
+        r'\centering',
+        r'\caption{Detector yield summary (fraction of possible detectors retained at final step).}',
+        r'\small',
+        r'\begin{tabular}{llccc}',
+        r'\toprule',
+        rf'& & \multicolumn{{3}}{{c}}{{{telescope.upper()}}} \\',
+        r'Category & Band & Avg & Median & Max \\',
+        r'\midrule',
+    ]
+
+    def fmt_row(cat: str, band: str) -> str:
+        a, med, x = m.get((cat, band), (np.nan, np.nan, np.nan))
+        return f"{latex_escape(cat)} & {latex_escape(band)} & {fmt_pct(a)} & {fmt_pct(med)} & {fmt_pct(x)} \\\\"
+
+    lines.append(fmt_row('All wafers', '+'.join(bands)))
+    lines.append(r'\midrule')
+    for b in bands:
+        lines.append(fmt_row('All wafers', b))
+    lines.append(r'\midrule')
+    for wafer in wafer_names:
+        key = str(wafer)
+        for b in bands:
+            lines.append(fmt_row(key, b))
+
+    lines += [r'\bottomrule', r'\end{tabular}', r'\end{table}']
+    return '\n'.join(lines)
+
+
+def latex_sample_summary_table_single(telescope: str, rows: list[tuple[str, float, float, float, float]]) -> str:
+    lines = [
+        r'\begin{table}[H]',
+        r'\centering',
+        r'\caption{Sample retention/flag summary from available \texttt{total\_samples}.}',
+        r'\small',
+        r'\begin{tabular}{lccc}',
+        r'\toprule',
+        rf'& \multicolumn{{3}}{{c}}{{{telescope.upper()}}} \\',
+        r'Row & Possible samples & Final samples & Flagged \% \\',
+        r'\midrule',
+    ]
+    for k, p, f, _keep, flag in rows:
+        lines.append(f"{latex_escape(k)} & {fmt_num(p)} & {fmt_num(f)} & {fmt_pct(flag)} \\\\")
+    lines += [r'\bottomrule', r'\end{tabular}', r'\end{table}']
+    return '\n'.join(lines)
+
+
+def latex_sample_flag_global_table_single(telescope: str, sf: dict[str, object]) -> str:
+    wb = sf['wafer_band']
+    g = sf['global'].iloc[0].to_dict()
+    step_cols = [c for c in g.keys() if c.startswith('pct_') and c != 'pct_all_flagged']
+    top3 = sorted(step_cols, key=lambda c: -g[c])[:3]
+    step_map = {'pct_turnaround_flags': 'Turnarounds', 'pct_noisy_subscan_flags': 'Noisy subscans', 'pct_smurfgaps': 'Smurfgaps'}
+    col_names = [step_map.get(c, c) for c in top3]
+    lines = [
+        r'\begin{table}[H]',
+        r'\centering',
+        r'\caption{Average flagged sample percentage for each wafer-band and cut type.}',
+        r'\small',
+        r'\begin{tabular}{ll' + 'c' * len(top3) + '}',
+        r'\toprule',
+        rf'Wafer & Band & \multicolumn{{{len(top3)}}}{{c}}{{{telescope.upper()}}} \\',
+        r'& & ' + ' & '.join(col_names) + r' \\',
+        r'\midrule',
+    ]
+    for _idx, row in wb.iterrows():
+        wafer = row['wafer']
+        band = row['band']
+        vals = [fmt_pct(row[c] / 100.0) for c in top3]
+        lines.append(f"{latex_escape(wafer)} & {latex_escape(band)} & " + ' & '.join(vals) + r' \\')
+    lines += [r'\bottomrule', r'\end{tabular}', r'\end{table}']
+    return '\n'.join(lines)
+
+
+def latex_sample_flag_band_table_single(telescope: str, sf: dict[str, object]) -> str:
+    b = sf['band'].set_index('band').to_dict(orient='index')
+    lines = [
+        r'\begin{table}[H]',
+        r'\centering',
+        r'\caption{Sample-flag weighted percentage by band (all wafers).}',
+        r'\small',
+        r'\begin{tabular}{lc}',
+        r'\toprule',
+        rf'Band & {telescope.upper()} flagged \% \\',
+        r'\midrule',
+    ]
+    for band in sf['band']['band'].tolist():
+        v = float(b.get(band, {}).get('pct_all_flagged', np.nan))
+        lines.append(f"{latex_escape(band)} & {fmt_pct(v / 100.0)} " + r"\\")
+    lines += [r'\bottomrule', r'\end{tabular}', r'\end{table}']
+    return '\n'.join(lines)
+
+
+def latex_noise_q50_global_table_single(telescope: str, n: dict[str, object]) -> str:
+    g = n['global'].iloc[0].to_dict()
+    lines = [
+        r'\begin{table}[H]',
+        r'\centering',
+        r'\caption{Noise-q50 weighted means from ObsDb noise columns (global all wafers and bands).}',
+        r'\small',
+        r'\begin{tabular}{lc}',
+        r'\toprule',
+        rf'Metric & {telescope.upper()} \\',
+        r'\midrule',
+    ]
+    for pol in NOISE_POLS:
+        for metric, _label in NOISE_Q50_METRICS:
+            col = f'noise_{pol}_{metric}'
+            lines.append(f"{latex_escape(col)} & {fmt_num(float(g.get(col, np.nan)))} \\\\")
+    lines += [r'\bottomrule', r'\end{tabular}', r'\end{table}']
+    return '\n'.join(lines)
+
+
+def latex_agg_noise_compare_table_single(telescope: str, a: dict[str, object]) -> str:
+    s2 = a['summary2'].set_index('band').to_dict(orient='index')
+    s3 = a['summary3'].iloc[0].to_dict()
+
+    lines = [
+        r'\begin{table}[H]',
+        r'\centering',
+        r'\caption{Aggregate-noise NET summary (units: $\mu$K$\sqrt{s}$).}',
+        r'\small',
+        r'\begin{tabular}{llc}',
+        r'\toprule',
+        rf'Scenario & Row & {telescope.upper()} mean NET\_array \\',
+        r'\midrule',
+    ]
+    for band in a['summary2']['band'].tolist():
+        v = float(s2.get(band, {}).get('mean_net_array', np.nan))
+        lines.append(f"2\\_per\\_band & {latex_escape(band)} & {fmt_num(v)} \\\\")
+    lines.append(
+        f"3\\_per\\_band\\_total & all\\_bands & {fmt_num(float(s3.get('mean_net_array', np.nan)))} \\\\")
+    lines += [r'\bottomrule', r'\end{tabular}', r'\end{table}']
+    return '\n'.join(lines)
+
+
+def gather_plot_paths(telescopes: list[str] = ['satp1', 'satp3']) -> dict[str, list[str]]:
     out = {'hist': [], 'non_time': [], 'time': [], 'sample_flag': [], 'agg_noise': [], 'step_tables': []}
 
     # Pre-generated step-table heatmap PNGs (created during build_report before this call).
@@ -1218,7 +1393,7 @@ def gather_plot_paths() -> dict[str, list[str]]:
         out['step_tables'].append(str(p.relative_to(ANALYSIS_ROOT)))
 
     # Histograms first.
-    for tel in ['satp1', 'satp3']:
+    for tel in telescopes:
         for fname in [
             f'{tel}/{tel}_det_counts_per_wafer_band.png',
             f'{tel}/{tel}_det_fractions_per_wafer_band.png',
@@ -1230,56 +1405,55 @@ def gather_plot_paths() -> dict[str, list[str]]:
         for p in sorted((ANALYSIS_ROOT / tel).glob(f'{tel}_ws*_f*_cuts_histograms_by_step.png')):
             out['hist'].append(str(p.relative_to(ANALYSIS_ROOT)))
 
-    # Non-time x-axis plots.
-    for tel in ['satp1', 'satp3']:
-        for band in ['f090', 'f150']:
-            for fname in [
-                f'{tel}/{tel}_{band}_retention_median_by_wafer.png',
-                f'{tel}/{tel}_{band}_cuts_median_by_wafer.png',
-            ]:
-                if (ANALYSIS_ROOT / fname).exists():
-                    out['non_time'].append(fname)
+    # Non-time x-axis plots (band-specific filenames -- glob so any band works).
+    for tel in telescopes:
+        for pattern in [
+            f'{tel}_f*_retention_median_by_wafer.png',
+            f'{tel}_f*_cuts_median_by_wafer.png',
+        ]:
+            for p in sorted((ANALYSIS_ROOT / tel).glob(pattern)):
+                out['non_time'].append(str(p.relative_to(ANALYSIS_ROOT)))
 
     # Time-axis plots.
-    for tel in ['satp1', 'satp3']:
+    for tel in telescopes:
         for fname in [
             f'{tel}/{tel}_det_hours_daily.png',
             f'{tel}/{tel}_det_hours_weekly.png',
             f'{tel}/{tel}_cumulative_hours.png',
             f'{tel}/{tel}_efficiency.png',
-            f'{tel}/{tel}_f090_cuts_timeseries_daily_by_wafer.png',
-            f'{tel}/{tel}_f150_cuts_timeseries_daily_by_wafer.png',
-            f'{tel}/{tel}_f090_cuts_timeseries_daily_grid.png',
-            f'{tel}/{tel}_f150_cuts_timeseries_daily_grid.png',
         ]:
             if (ANALYSIS_ROOT / fname).exists():
                 out['time'].append(fname)
+        for pattern in [
+            f'{tel}_f*_cuts_timeseries_daily_by_wafer.png',
+            f'{tel}_f*_cuts_timeseries_daily_grid.png',
+        ]:
+            for p in sorted((ANALYSIS_ROOT / tel).glob(pattern)):
+                out['time'].append(str(p.relative_to(ANALYSIS_ROOT)))
 
     # Sample-flag and noise-q50 plots from ISO_V4_SAMPLE_FLAG_ANALYSIS coverage.
-    for tel in ['satp1', 'satp3']:
+    for tel in telescopes:
+        sf_dir = ANALYSIS_ROOT / tel / 'sample_flag_percentages'
         for fname in [
             f'{tel}/sample_flag_percentages/sample_flag_hists_percent_all_wafers_all_bands.png',
-            f'{tel}/sample_flag_percentages/sample_flag_hists_percent_band_f090.png',
-            f'{tel}/sample_flag_percentages/sample_flag_hists_percent_band_f150.png',
             f'{tel}/sample_flag_percentages/noise_stats_hists_all_wafers_all_bands.png',
-            f'{tel}/sample_flag_percentages/noise_stats_hists_band_f090.png',
-            f'{tel}/sample_flag_percentages/noise_stats_hists_band_f150.png',
         ]:
             if (ANALYSIS_ROOT / fname).exists():
                 out['sample_flag'].append(fname)
+        for pattern in ['sample_flag_hists_percent_band_f*.png', 'noise_stats_hists_band_f*.png']:
+            for p in sorted(sf_dir.glob(pattern)):
+                out['sample_flag'].append(str(p.relative_to(ANALYSIS_ROOT)))
 
     # Aggregate-noise NET plots from ISO_V4_AGG_NOISE_ANALYSIS coverage.
-    for tel in ['satp1', 'satp3']:
+    for tel in telescopes:
         agg_dir = ANALYSIS_ROOT / tel / 'agg_noise'
         # Always include scenario2 (band-level) histograms.
         for p in sorted(agg_dir.glob('agg_noise_hist_scenario2_*.png')):
             out['agg_noise'].append(str(p.relative_to(ANALYSIS_ROOT)))
         # Include a curated subset of scenario1 wafer-band histograms for readability.
         for wafer in AGG_NOISE_SCENARIO1_WAFERS_FOR_REPORT:
-            for band in ['f090', 'f150']:
-                p = agg_dir / f'agg_noise_hist_scenario1_{wafer}_{band}.png'
-                if p.exists():
-                    out['agg_noise'].append(str(p.relative_to(ANALYSIS_ROOT)))
+            for p in sorted(agg_dir.glob(f'agg_noise_hist_scenario1_{wafer}_f*.png')):
+                out['agg_noise'].append(str(p.relative_to(ANALYSIS_ROOT)))
 
     return out
 
@@ -1389,7 +1563,7 @@ def build_report() -> None:
         render_step_table_as_png(_title, _steps, _rows, _p, pct=True)
         _step_png_paths[_slug] = _p
 
-    plots = gather_plot_paths()
+    plots = gather_plot_paths(['satp1', 'satp3'])
     plots = {
         k: expand_plots_for_report_pages(v)
         for k, v in plots.items()
@@ -1457,6 +1631,143 @@ def build_report() -> None:
                   'SATP3 sample-flag proxy contribution by step (mean/median fractions). Color = mean %; parentheses = median %.'),
         r'\subsection{Aggregate Noise NET Summary}',
         latex_agg_noise_compare_table(agg_noise_satp1, agg_noise_satp3),
+        r'\clearpage',
+        r'\section{Plots (all plots moved after tables)}',
+        r'\subsection{Histograms first}',
+    ]
+
+    for p in plots['hist']:
+        tex_lines.append(fig_block(p, f'Histogram: {p}'))
+
+    tex_lines += [r'\subsection{Other non-time plots}']
+    for p in plots['non_time']:
+        tex_lines.append(fig_block(p, f'Non-time plot: {p}'))
+
+    tex_lines += [r'\subsection{Time-axis plots}']
+    for p in plots['time']:
+        tex_lines.append(fig_block(p, f'Time-axis plot: {p}'))
+
+    tex_lines += [r'\subsection{Sample-Flag and Noise-q50 plots}']
+    for p in plots['sample_flag']:
+        tex_lines.append(fig_block(p, f'Sample-flag or noise-q50 plot: {p}'))
+
+    tex_lines += [r'\subsection{Aggregate-noise NET plots}']
+    for p in plots['agg_noise']:
+        tex_lines.append(fig_block(p, f'Aggregate-noise NET distribution plot: {p}'))
+
+    tex_lines += [r'\end{document}']
+
+    tex_path = ANALYSIS_ROOT / 'iso_v4_analysis_report.tex'
+    pdf_path = ANALYSIS_ROOT / 'iso_v4_analysis_report.pdf'
+    tex_path.write_text('\n'.join(tex_lines), encoding='utf-8')
+
+    for _ in range(2):
+        subprocess.run(
+            ['pdflatex', '-interaction=nonstopmode', '-output-directory', str(ANALYSIS_ROOT), str(tex_path)],
+            cwd=str(ANALYSIS_ROOT),
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+
+    if not pdf_path.exists():
+        raise RuntimeError('PDF was not produced.')
+
+    print(f'Wrote: {tex_path}')
+    print(f'Wrote: {pdf_path} ({pdf_path.stat().st_size / 1024:.0f} kB)')
+
+
+def build_report_single(telescope: str) -> None:
+    """Single-telescope variant of build_report() (e.g. for satp2, which has
+    no side-by-side comparison partner). Requires SQLITE_PATHS[telescope] and
+    ANALYSIS_ROOT to already be set by the caller."""
+    td = load_telescope_data(telescope, SQLITE_PATHS[telescope])
+
+    sample_flag = compute_sample_flag_products(telescope, SQLITE_PATHS[telescope])
+    noise_q50 = compute_noise_q50_products(telescope, SQLITE_PATHS[telescope])
+    agg_noise = compute_agg_noise_products(telescope)
+
+    hours = compute_hours_stats(td)
+    y = compute_detector_yield_rows(td)
+    det_steps, det_cut_rows = compute_cut_step_stats(td)
+    samp_rows = compute_sample_summary_rows(td)
+    samp_steps, samp_proxy_rows, sample_step_cols_present = compute_sample_step_proxy(td)
+
+    step_tables_dir = ANALYSIS_ROOT / 'step_tables'
+    step_tables_dir.mkdir(parents=True, exist_ok=True)
+    _step_png_paths: dict[str, Path] = {}
+    for _slug, _title, _steps, _rows in [
+        (f'{telescope}_det_cuts', f'{telescope.upper()} detector cut fractions by step', det_steps, det_cut_rows),
+        (f'{telescope}_samp_proxy', f'{telescope.upper()} sample-flag proxy contribution by step', samp_steps, samp_proxy_rows),
+    ]:
+        _p = step_tables_dir / f'{_slug}.png'
+        render_step_table_as_png(_title, _steps, _rows, _p, pct=True)
+        _step_png_paths[_slug] = _p
+
+    plots = gather_plot_paths([telescope])
+    plots = {
+        k: expand_plots_for_report_pages(v)
+        for k, v in plots.items()
+    }
+
+    tex_lines: list[str] = [
+        r'\documentclass[11pt,a4paper]{article}',
+        r'\usepackage[margin=1.8cm]{geometry}',
+        r'\usepackage{graphicx}',
+        r'\usepackage{booktabs}',
+        r'\usepackage{amsmath}',
+        r'\usepackage{amssymb}',
+        r'\usepackage{float}',
+        r'\usepackage{pdflscape}',
+        r'\usepackage[colorlinks=true,linkcolor=blue]{hyperref}',
+        r'\graphicspath{{./}}',
+        '',
+        rf'\title{{ISO V4 Detector Retention, Cuts, and Sample-Flag Summary --- {telescope.upper()}}}',
+        rf'\date{{{date.today().isoformat()}}}',
+        r'\begin{document}',
+        r'\maketitle',
+        r'\tableofcontents',
+        r'\clearpage',
+        r'\section{Computation Template and Definitions}',
+        r'This report is generated from ObsDb detector-step columns and \texttt{total\_samples}. Definitions:',
+        r'\begin{itemize}',
+        r'\item Per wafer-band denominators: $N_{\max}^{\mathrm{wb}} = 860$ detectors.',
+        r'\item Per band denominators: $N_{\max}^{\mathrm{band}} = 7 \times 860 = 6020$.',
+        r'\item All-band denominators: $N_{\max}^{\mathrm{all}} = 2 \times 6020 = 12040$.',
+        r'\item Detector retention fraction at final step: $f_{\mathrm{ret}} = N_{\mathrm{final}} / N_{\max}$.',
+        r'\item Detector cut increment at step $k$: $c_k = (N_{k-1} - N_k)/N_{\max}$ with $c_0 = (N_{\max}-N_0)/N_{\max}$.',
+        r'\item Count distributions are histograms of per-observation detector counts or fractions.',
+        r'\item Retention plots show retained detectors by pipeline step; cut plots show incremental losses by step.',
+        r'\item Observation hours: $h_{\mathrm{obs}} = \sum \Delta t$ over successful observations.',
+        r'\item Detector-hours: $h_{\mathrm{det}} = \sum (N_{\mathrm{final}} \cdot \Delta t)$.',
+        r'\item Calendar hours: $h_{\mathrm{cal}} = (t_{\max}-t_{\min})/3600$.',
+        r'\item Detector-hour fraction: $h_{\mathrm{det}} / (N_{\max} h_{\mathrm{cal}})$.',
+        r'\item Obs-hour fraction: $h_{\mathrm{obs}} / h_{\mathrm{cal}}$.',
+        r'\end{itemize}',
+        r'For sample accounting, ObsDb currently provides \texttt{total\_samples} but no explicit sample-step columns. We estimate possible samples from a per-observation-band baseline samples-per-detector, then compare final to possible samples. Step-by-step sample impact is reported as a detector-cut-weighted proxy to avoid double counting.',
+        '',
+        r'\section{Summary Tables}',
+        r'\subsection{Detector-Hours and Calendar-Hours}',
+        latex_hours_table_single(telescope, hours),
+        r'\subsection{Detector Yield (separate table)}',
+        latex_yield_table_single(telescope, y, td.wafer_names, td.bands),
+        r'\subsection{Detector-Cut Step Impact (Mean/Median by step)}',
+        fig_block(str(_step_png_paths[f'{telescope}_det_cuts'].relative_to(ANALYSIS_ROOT)),
+                  f'{telescope.upper()} detector cut fractions by step (rows: total, all wafers by band, then each wafer-band). Color = mean %; parentheses = median %.'),
+        r'\subsection{Sample Flags Summary}',
+        latex_sample_summary_table_single(telescope, samp_rows),
+        r'\subsection{Sample-Flag Weighted Percentages (from sample-step columns)}',
+        latex_sample_flag_band_table_single(telescope, sample_flag),
+        latex_sample_flag_global_table_single(telescope, sample_flag),
+        r'\subsection{Noise q50 Weighted Means (from ObsDb noise columns)}',
+        latex_noise_q50_global_table_single(telescope, noise_q50),
+        r'\subsection{Sample-Flag Step Impact (Proxy)}',
+        rf'Sample-step columns present in {telescope.upper()} ObsDb: {"yes" if sample_step_cols_present else "no"}.',
+        r'Figures below show proxy allocations of total flagged sample fraction across detector-cut steps, weighted by each observation''s incremental detector cuts (non-overlapping by construction).',
+        fig_block(str(_step_png_paths[f'{telescope}_samp_proxy'].relative_to(ANALYSIS_ROOT)),
+                  f'{telescope.upper()} sample-flag proxy contribution by step (mean/median fractions). Color = mean %; parentheses = median %.'),
+        r'\subsection{Aggregate Noise NET Summary}',
+        latex_agg_noise_compare_table_single(telescope, agg_noise),
         r'\clearpage',
         r'\section{Plots (all plots moved after tables)}',
         r'\subsection{Histograms first}',

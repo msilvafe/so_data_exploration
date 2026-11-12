@@ -209,3 +209,20 @@ __marimo__/
 
 # Local generated plots
 tiger/202601_v4/plots/
+
+# ---- Analysis artifacts: keep the repo to code only ----
+# Study write-ups, figures, job logs and scratch outputs live under
+# /scratch/gpfs/SIMONSOBS/users/ms3067/so_data_exploration_archive/
+STUDY_*.md
+PROPOSAL_*.md
+HANDOFF_*.md
+CONFLUENCE_*
+REVIEW_*.md
+*.png
+*.pdf
+*.err
+*.out
+*.bak*
+*_report.*
+for_comparison/
+.vscode/
