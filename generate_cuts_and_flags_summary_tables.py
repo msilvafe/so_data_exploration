@@ -94,7 +94,7 @@ def get_ordered_det_cols(cols):
 
 
 def get_flag_cols(cols):
-    known_prefixes = ('det_', 'noise_', 't2p_')
+    known_prefixes = ('det_', 'noise_', 't2p_', 'stat_')
     known_exact = {'timestamp', 'obs_id', 'wafer', 'band', 'total_samples',
                     'success', 'failure_step', 'error_message'}
     return [c for c in cols if c not in known_exact and not c.startswith(known_prefixes)]
