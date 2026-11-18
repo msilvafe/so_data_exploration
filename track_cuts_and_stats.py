@@ -13,6 +13,7 @@ from typing import Optional, Union, Callable, List, Dict, Any
 import numpy as np
 import argparse
 import traceback
+import warnings
 from sotodlib.utils.procs_pool import get_exec_env
 import copy
 from tqdm import tqdm
@@ -223,7 +224,7 @@ def build_process_names(configs_init, configs_proc):
         Ordered list of process names including the initial state.
     """
     cfg_init, _ = pp_util.get_preprocess_context(configs_init)
-    cfg_proc, _ = pp_util.get_preprocess_context(configs_proc)
+    cfg_proc = pp_util.get_preprocess_context(configs_proc)[0] if configs_proc else None
 
     names = ["starting"]
 
@@ -627,6 +628,89 @@ def extract_statistics(aman_init, aman_proc, pipe_init, pipe_proc, return_aggreg
 
     return noise_stats, t2p_stats, aggregate_data
 
+# Automatic per-group summaries ------------------------------------------------
+#
+# Every per-detector quantity the pipeline saved is summarised over the
+# detectors that survive the whole pipeline (the same population as the
+# noise_{T,Q,U}_* columns), with no list of fields to maintain: a new stats
+# step in a config (e.g. a noise step with fit: False, or noise_ratio) gets
+# columns without code changes. Fields are found from their axis assignments:
+#
+#   (dets,)                     numeric  -> the values themselves
+#   (dets,)                     bool     -> fraction True (one '_frac' column)
+#   (dets, noise_model_coeffs)           -> one quantity per coefficient
+#                                           (white_noise, fknee, alpha)
+#   (dets, subscans)                     -> per-detector median over subscans
+#
+# Anything else (hwpss bins and modes, trend bins, covariances, strings,
+# sample-axis data) is skipped. Columns are named
+# stat_<field>_<subfield>_{avg,q10,q25,q50,q75,q90}; e.g.
+# stat_noiseT_20_30_white_noise_q50 or stat_noiseQ_fit_fknee_q50. The 'stat_'
+# prefix keeps them apart from the bare sample-flag columns.
+AUTO_STAT_PREFIX = 'stat_'
+AUTO_STAT_QUANTILES = (0.1, 0.25, 0.5, 0.75, 0.9)
+
+
+def _auto_stat_name(*parts):
+    return AUTO_STAT_PREFIX + re.sub(r'[^0-9A-Za-z_]+', '_', '_'.join(parts))
+
+
+def iter_per_det_fields(proc_aman):
+    """Yield (name, values, kind) for each per-detector quantity in proc_aman.
+
+    kind is 'dist' (summarised by mean and quantiles) or 'frac' (booleans,
+    summarised by the fraction True). Only the first level of wrapped
+    AxisManagers is searched, which is where preprocess steps save.
+    """
+    for child_name in proc_aman._fields:
+        child = proc_aman[child_name]
+        if not isinstance(child, AxisManager) or 'dets' not in child._axes:
+            continue
+        for field in child._fields:
+            vals = child[field]
+            if not isinstance(vals, np.ndarray) or vals.dtype.kind not in 'fiub':
+                continue
+            axes = child._assignments.get(field) or []
+            if not axes or axes[0] != 'dets':
+                continue
+            if vals.ndim == 1:
+                yield (_auto_stat_name(child_name, field), vals,
+                       'frac' if vals.dtype.kind == 'b' else 'dist')
+            elif vals.ndim == 2 and axes[1] == 'noise_model_coeffs':
+                labels = child._axes['noise_model_coeffs'].vals
+                for i, lab in enumerate(labels):
+                    yield _auto_stat_name(child_name, field, str(lab)), vals[:, i], 'dist'
+            elif vals.ndim == 2 and axes[1] == 'subscans':
+                with warnings.catch_warnings():
+                    warnings.simplefilter('ignore', RuntimeWarning)   # all-NaN rows
+                    per_det = np.nanmedian(vals.astype(float), axis=1)
+                yield _auto_stat_name(child_name, field, 'subscan_med'), per_det, 'dist'
+
+
+def extract_auto_stats(proc_aman):
+    """Summaries of every per-detector field in proc_aman (see above).
+
+    proc_aman should already be restricted to the surviving detectors.
+    Returns {column_name: float}; NaN where no detector has a finite value.
+    """
+    out = {}
+    for name, vals, kind in iter_per_det_fields(proc_aman):
+        if kind == 'frac':
+            out[f'{name}_frac'] = float(np.mean(vals)) if vals.size else np.nan
+            continue
+        x = np.asarray(vals, dtype=float)
+        x = x[np.isfinite(x)]
+        if x.size:
+            qs = np.quantile(x, AUTO_STAT_QUANTILES)
+            out[f'{name}_avg'] = float(np.mean(x))
+        else:
+            qs = [np.nan] * len(AUTO_STAT_QUANTILES)
+            out[f'{name}_avg'] = np.nan
+        for q, v in zip(AUTO_STAT_QUANTILES, qs):
+            out[f'{name}_q{int(round(q * 100))}'] = float(v)
+    return out
+
+
 def write_band_noise_to_hdf5(band_data, band, output_path):
     """Write band-level aggregated noise data to HDF5 file.
 
@@ -677,7 +761,7 @@ def write_band_noise_to_hdf5(band_data, band, output_path):
 def track_cuts_and_stats(obsid: str, wafer: str, band: str, configs_init: dict, configs_proc: dict,
                         process_names: Optional[List[str]] = None, flag_labels: Optional[List[str]] = None,
                         verbosity: int = 0, aggregate_noise: str = None, restrict_final_cuts: bool = False,
-                        profile_timing: bool = False):
+                        profile_timing: bool = False, auto_stats: bool = False):
     """Track detector counts, sample cuts, and statistics for one observation.
 
     Parameters
@@ -702,6 +786,9 @@ def track_cuts_and_stats(obsid: str, wafer: str, band: str, configs_init: dict, 
         If specified ('T', 'Q', or 'U'), also return aggregated noise data.
     restrict_final_cuts : bool, optional
         If True, compute statistics only for detectors that survived all pipeline cuts.
+    auto_stats : bool, optional
+        If True, also summarise every per-detector field the pipeline saved
+        (see extract_auto_stats) into 'auto_stats'.
 
     Returns
     -------
@@ -722,6 +809,7 @@ def track_cuts_and_stats(obsid: str, wafer: str, band: str, configs_init: dict, 
         'proc_process_s': {},
         'build_valid_and_sample_cuts_s': 0.0,
         'extract_statistics_s': 0.0,
+        'auto_stats_s': 0.0,
         'total_s': 0.0,
     }
     
@@ -850,6 +938,12 @@ def track_cuts_and_stats(obsid: str, wafer: str, band: str, configs_init: dict, 
                 verbosity=verbosity
             )
             timing_breakdown['extract_statistics_s'] = time.time() - t0
+
+            # proc_aman_init has been restricted to the surviving detectors
+            # after every step, and holds the proc layer too when there is one.
+            t0 = time.time()
+            auto = extract_auto_stats(proc_aman_init) if auto_stats else {}
+            timing_breakdown['auto_stats_s'] = time.time() - t0
             
             # Filter aggregation data to requested polarization only
             aggregate_data = None
@@ -864,6 +958,7 @@ def track_cuts_and_stats(obsid: str, wafer: str, band: str, configs_init: dict, 
                 'sample_cuts': sample_cuts,
                 'noise_stats': noise_stats,
                 't2p_stats': t2p_stats,
+                'auto_stats': auto,
                 'aggregate_data': aggregate_data,
                 'failure_step': None,
                 'error_message': None,
@@ -1017,6 +1112,13 @@ def save_results_to_db(db_path: str, obs_id: str, wafer: str, band: str, results
     ]:
         data[f"t2p_{metric}"] = t2p_stats.get(metric)
 
+    # Automatic summaries: their columns depend on what the pipeline saved, so
+    # they are added to the table the first time they appear.
+    auto = results.get('auto_stats') or {}
+    if auto:
+        obsdb.add_obs_columns([(c, float) for c in auto], ignore_duplicates=True, commit=False)
+        data.update(auto)
+
     # Normalize numpy scalar types to native Python types before handing off to
     # sqlite3. numpy.float32 isn't a `float` subclass (unlike numpy.float64) and
     # isn't recognized by sqlite3's parameter binding, which silently falls back
@@ -1044,6 +1146,8 @@ def main():
     parser.add_argument('--proc-config', help='Proc pipeline config file (optional)')
     parser.add_argument('--db-path', required=True, help='SQLite database path')
     parser.add_argument('--verbosity', type=int, default=0, help='Verbosity level (0-2)')
+    parser.add_argument('--auto-stats', action='store_true',
+                        help='Also summarise every per-detector field the pipeline saved (stat_* columns)')
     
     args = parser.parse_args()
     
@@ -1068,7 +1172,8 @@ def main():
     
     # Track cuts and statistics
     results = track_cuts_and_stats(args.obs_id, args.wafer, args.band, configs_init, configs_proc,
-                                   process_names, full_flag_labels, args.verbosity)
+                                   process_names, full_flag_labels, args.verbosity,
+                                   auto_stats=args.auto_stats)
     
     # Save to database
     save_results_to_db(args.db_path, args.obs_id, args.wafer, args.band, results,

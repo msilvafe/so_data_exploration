@@ -33,7 +33,8 @@ from track_cuts_and_stats import (
 logger = init_logger("track_cuts_stats_parallel")
 
 def process_work_item(obs_id, wafer, band, configs_init, configs_proc, 
-                      process_names, full_flag_labels, verbosity, aggregate_noise):
+                      process_names, full_flag_labels, verbosity, aggregate_noise,
+                      auto_stats=False):
     """Worker function to process a single work item.
     
     Parameters
@@ -56,6 +57,8 @@ def process_work_item(obs_id, wafer, band, configs_init, configs_proc,
         Verbosity level
     aggregate_noise : str or None
         Polarization to aggregate
+    auto_stats : bool
+        Also summarise every per-detector field the pipeline saved
     
     Returns
     -------
@@ -66,7 +69,8 @@ def process_work_item(obs_id, wafer, band, configs_init, configs_proc,
     try:
         results = track_cuts_and_stats(obs_id, wafer, band, configs_init, configs_proc,
                                       process_names, full_flag_labels, verbosity,
-                                      aggregate_noise=aggregate_noise)
+                                      aggregate_noise=aggregate_noise,
+                                      auto_stats=auto_stats)
         worker_walltime_s = time.time() - start_wall
         return {
             'obs_id': obs_id,
@@ -99,8 +103,12 @@ def _main(executor, as_completed_callable, args):
     with open(args.init_config, 'r') as f:
         configs_init = yaml.safe_load(f)
     
-    with open(args.proc_config, 'r') as f:
-        configs_proc = yaml.safe_load(f)
+    # Init-only runs (no proc layer) leave configs_proc as None; the tracker
+    # then replays the init pipeline only.
+    configs_proc = None
+    if args.proc_config:
+        with open(args.proc_config, 'r') as f:
+            configs_proc = yaml.safe_load(f)
     
     # Build process names and flag labels for table creation
     process_names = build_process_names(configs_init, configs_proc)
@@ -224,7 +232,8 @@ def _main(executor, as_completed_callable, args):
         for obs_id, wafer, band in work_items:
             future = executor.submit(process_work_item, obs_id, wafer, band, 
                                     configs_init, configs_proc, process_names, 
-                                    full_flag_labels, args.verbosity, args.aggregate_noise)
+                                    full_flag_labels, args.verbosity, args.aggregate_noise,
+                                    args.auto_stats)
             futures[future] = (obs_id, wafer, band)
         
         # Use batch processing for database operations
@@ -345,7 +354,7 @@ def _main(executor, as_completed_callable, args):
 def main():
     parser = argparse.ArgumentParser(description='Track cuts and statistics in parallel via sotodlib get_exec_env')
     parser.add_argument('--init-config', required=True, help='Init pipeline config file')
-    parser.add_argument('--proc-config', required=True, help='Proc pipeline config file') 
+    parser.add_argument('--proc-config', default=None, help='Proc pipeline config file (omit for an init-only run)')
     parser.add_argument('--db-path', required=True, help='SQLite database path')
     parser.add_argument('--query', help='Query to pass to observation list')
     parser.add_argument('--obs-list', help='Text file with list of observation IDs')
@@ -360,6 +369,9 @@ def main():
     parser.add_argument('--overwrite', action='store_true', help='Overwrite existing entries')
     parser.add_argument('--aggregate-noise', choices=['T', 'Q', 'U'], help='Aggregate white noise data for polarization')
     parser.add_argument('--aggregate-output', help='Base path for aggregated HDF5 output (e.g., /path/to/noise)')
+    parser.add_argument('--auto-stats', action='store_true',
+                        help='Also summarise every per-detector field the pipeline saved into '
+                             'stat_<field>_<subfield>_{avg,q10..q90} columns')
 
     args = parser.parse_args()
 

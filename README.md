@@ -99,6 +99,8 @@ Other options worth knowing:
 | `--aggregate-noise {T,Q,U}` | also aggregate per-detector white noise for that component |
 | `--aggregate-output BASE` | path stem for the aggregated HDF5 |
 | `--nprocs N` | process-pool size; ignored in MPI mode, which uses the communicator |
+| `--auto-stats` | also summarise every per-detector field the pipeline saved (see below) |
+| `--proc-config` | optional; omit it for an init-only run |
 
 Redirect job logs with `>>` to a `${SLURM_JOB_ID}`-stamped path. A fixed path with
 `>` truncates earlier logs, which has previously destroyed the per-group failure
@@ -116,7 +118,16 @@ families:
 - bare flag names (`noisy_subscan_flags`, `glitches_*`, `jumps_*`, …) — **sample**
   counts, to be divided by `total_samples`.
 - `noise_{T,Q,U}_{white_noise,fknee,alpha}_{avg,q10…q90}` and `array_noise`.
-- `success`, `failure_step`, `error_message`, and `t2p_*`.
+- `success`, `failure_step`, `error_message`, and `t2p_*` (read from the proc layer only).
+- with `--auto-stats`: `stat_<field>_<subfield>_{avg,q10,q25,q50,q75,q90}` for every
+  per-detector field the pipeline saved, over the surviving detectors. Fields are
+  found from their axis assignments, so new stats steps need no code change:
+  `(dets,)` values; `(dets,)` booleans as one `_frac` column; noise `fit` split into
+  `white_noise` / `fknee` / `alpha`; `(dets, subscans)` as the per-detector median
+  over subscans. Other shapes (hwpss bins, trend bins, covariances) are skipped.
+  Columns are added to the table the first time they appear. Examples:
+  `stat_noiseT_20_30_white_noise_q50`, `stat_noiseQ_fit_fknee_q50`,
+  `stat_noise_ratio_T_rdets_q50`, `stat_t2p_coeffsQ_avg`.
 
 > **Resolve step columns by name, not by number.** The `det_<N>` numbering is not
 > aligned across platforms: SATP2's config has no `move` step, so everything after
@@ -126,6 +137,40 @@ families:
 
 Rows with `total_samples = 0` never produced data and should be excluded from
 population statistics.
+
+### Groups that never reached the archive
+
+The database above is conditioned on "made it into the archive": a group whose
+detectors were all cut, or that raised, has no archive entry, so it reads as a
+`success = 0` row with no counts. `build_preprocessing_attrition.py` accounts for
+every group from the run's own outputs: the config, the jobdb, the archive index,
+`errlog.txt` and the `preprocess_tod` logs. It also uses the context, obsdb and
+metadata the run used. Nothing derived afterwards is needed.
+
+```bash
+$PYTHON build_preprocessing_attrition.py \
+    --config   /path/to/preprocess_config_init.yaml \
+    --log      '/path/to/logs/preprocess_*.log' \
+    --obs-list /path/to/obs_list.txt \
+    --db       attrition.sqlite \
+    [--load-meta --nproc 8]
+```
+
+Run it once per config into the same `--db`; rows are keyed by `run` (default: the
+config file stem). Tables: `groups` (one row per group with what the jobdb, archive,
+errlog and logs each say, and a combined `outcome` / `outcome_step`), `step_dets`
+(detectors left after every step), `steps` (`key` matches steps across platforms),
+`obs_info` (obsdb rows) and, with `--load-meta`, `group_meta` (loaded detectors per
+group and det type, det_cal r_frac on transition / below / above, P_bias).
+
+`step_dets` needs logs with the worker pid on every line (the formatter
+`'%(asctime)s pid=%(process)d: %(message)s'` on the `preprocess` logger). Stock
+logs interleave workers, so from them only the per-group failure and success
+lines are used. `--load-meta` runs `get_meta` once per obs (2-3 s each), so run it
+on a compute node. The rest is light.
+
+The script ends with consistency checks (jobdb vs archive vs errlog vs logs vs the
+obs list); all should be 0 for a complete run.
 
 ---
 
